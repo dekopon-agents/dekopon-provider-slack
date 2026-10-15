@@ -1,4 +1,4 @@
-use crate::{Lookup, LookupInput, Replace, ReplaceInput, Slack};
+use crate::{Lookup, LookupInput, Post, PostInput, Replace, ReplaceInput, Slack};
 use clap::{Parser, Subcommand};
 use dekopon_provider_sdk::provider::{Proposal, Usage};
 
@@ -14,6 +14,14 @@ pub struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    Post {
+        #[arg(value_name = "CHANNEL")]
+        channel: String,
+        #[arg(value_name = "TEXT")]
+        text: String,
+        #[arg(value_name = "THREAD_TS")]
+        thread_ts: Option<String>,
+    },
     Canvas {
         #[command(subcommand)]
         operation: Canvas,
@@ -37,6 +45,15 @@ enum Canvas {
 
 pub(crate) fn propose(args: Args) -> Result<Proposal<Slack>, Usage> {
     match args.command {
+        Command::Post {
+            channel,
+            text,
+            thread_ts,
+        } => Ok(Proposal::to::<Post>(PostInput {
+            channel,
+            text,
+            thread_ts,
+        })),
         Command::Canvas {
             operation: Canvas::Lookup { text },
         } => Ok(Proposal::to::<Lookup>(LookupInput {

@@ -1,4 +1,4 @@
-use crate::SlackError;
+use crate::{PostInput, SlackError};
 use dekopon_provider_sdk::provider::endpoint::Base;
 use dekopon_provider_sdk::provider::{Header, HttpError, Request, Response};
 use serde::{Deserialize, Serialize};
@@ -163,6 +163,65 @@ pub fn replace(
     Ok(ReplaceResult {
         canvas_id: canvas_id.to_owned(),
         section_id: id,
+    })
+}
+
+#[derive(Serialize)]
+pub struct PostResult {
+    channel: String,
+    ts: String,
+}
+
+fn valid_ts(ts: &str) -> bool {
+    ts.split_once('.').is_some_and(|(seconds, fraction)| {
+        !seconds.is_empty()
+            && seconds.bytes().all(|b| b.is_ascii_digit())
+            && fraction.len() == 6
+            && fraction.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+pub fn post_message(
+    base: &Base,
+    input: &PostInput,
+    mut send: impl FnMut(Request) -> Result<Response, HttpError>,
+) -> Result<PostResult, SlackError> {
+    if input.channel.trim().is_empty() || input.text.trim().is_empty() {
+        return Err(SlackError::InvalidInput);
+    }
+    if input.thread_ts.as_deref().is_some_and(|ts| !valid_ts(ts)) {
+        return Err(SlackError::InvalidTimestamp);
+    }
+    let mut body = json!({"channel":input.channel,"text":input.text});
+    if let Some(ts) = &input.thread_ts {
+        body["thread_ts"] = json!(ts);
+    }
+    let response = post(base, "/api/chat.postMessage", body, &mut send)
+        .map_err(|_| SlackError::UnknownResult)?;
+    if response.status != 200 {
+        return Err(SlackError::UnknownResult);
+    }
+    let reply: Value =
+        serde_json::from_slice(&response.body).map_err(|_| SlackError::UnknownResult)?;
+    if reply.get("ok") == Some(&json!(false)) {
+        return Err(SlackError::PostRefused);
+    }
+    if reply.get("ok") != Some(&json!(true)) {
+        return Err(SlackError::UnknownResult);
+    }
+    let channel = reply
+        .get("channel")
+        .and_then(Value::as_str)
+        .filter(|channel| !channel.is_empty())
+        .ok_or(SlackError::UnknownResult)?;
+    let ts = reply
+        .get("ts")
+        .and_then(Value::as_str)
+        .filter(|ts| valid_ts(ts))
+        .ok_or(SlackError::UnknownResult)?;
+    Ok(PostResult {
+        channel: channel.into(),
+        ts: ts.into(),
     })
 }
 

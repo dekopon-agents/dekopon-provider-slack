@@ -17,17 +17,18 @@ pub struct Slack;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SlackSettings {
-    canvas_id: String,
+    #[serde(default)]
+    canvas_id: Option<String>,
     #[serde(default = "default_base", deserialize_with = "deserialize_base")]
     base_url: Base,
 }
 
 impl SlackSettings {
     fn canvas_id(&self) -> Result<&str, SlackError> {
-        if self.canvas_id.trim().is_empty() {
-            return Err(SlackError::InvalidSettings);
-        }
-        Ok(&self.canvas_id)
+        self.canvas_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or(SlackError::InvalidSettings)
     }
 }
 
@@ -71,9 +72,9 @@ fn deserialize_base<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Base, 
 impl Provider for Slack {
     const ID: &'static str = "slack";
     const COMMAND_WORDS: &'static [&'static str] = &["slack"];
-    const DESCRIPTION: &'static str = "Narrow Slack canvas section operations";
+    const DESCRIPTION: &'static str = "Narrow Slack canvas and message operations";
     type Args = commands::Args;
-    type Capabilities = (Lookup, Replace);
+    type Capabilities = (Lookup, Replace, Post);
 
     fn propose(args: Self::Args, _stdin_piped: bool) -> Result<Proposal<Self>, Usage> {
         commands::propose(args)
@@ -157,6 +158,41 @@ impl Capability for Replace {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PostInput {
+    pub channel: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_ts: Option<String>,
+}
+
+pub struct Post;
+impl Capability for Post {
+    type Provider = Slack;
+    const NAME: &'static str = "post";
+    const DESCRIPTION: &'static str = "Post a message to a channel, optionally in a thread";
+    const EFFECT: EffectKind = EffectKind::ExternalWrite;
+    const RISK: RiskLevel = RiskLevel::High;
+    type Input = PostInput;
+    type Needs = (Settings<SlackSettings>, Http);
+    type Error = SlackError;
+
+    fn run(
+        input: Self::Input,
+        (settings, http): Self::Needs,
+        out: &mut Stdout,
+    ) -> Result<(), Self::Error> {
+        let result = slack::post_message(&settings.into_inner().base_url, &input, |request| {
+            http.send(request)
+        })?;
+        serde_json::to_writer(&mut *out, &result).map_err(|_| SlackError::InvalidResponse)?;
+        out.write_all(b"\n")
+            .map_err(|_| SlackError::InvalidResponse)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub enum SlackError {
     InvalidSettings,
@@ -168,19 +204,23 @@ pub enum SlackError {
     UnknownResult,
     AccessDenied,
     HttpFailed,
+    InvalidTimestamp,
+    PostRefused,
 }
 impl fmt::Display for SlackError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::InvalidSettings => "canvas settings are invalid",
-            Self::InvalidInput => "markdown must have a non-empty line",
+            Self::InvalidInput => "input must have a non-empty value",
             Self::InvalidResponse => "Slack returned an invalid response",
             Self::NotFound => "no matching section or canvas not available",
             Self::Ambiguous => "more than one section matched",
             Self::Conflict => "canvas section edit conflicts with current state",
-            Self::UnknownResult => "canvas edit result could not be verified",
+            Self::UnknownResult => "Slack result could not be verified",
             Self::AccessDenied => "canvas not accessible to this credential",
             Self::HttpFailed => "Slack request failed",
+            Self::InvalidTimestamp => "invalid Slack thread timestamp",
+            Self::PostRefused => "Slack refused the post",
         })
     }
 }
@@ -196,6 +236,8 @@ impl Failure for SlackError {
             Self::UnknownResult => Code::new("unknown-result"),
             Self::AccessDenied => Code::new("access-denied"),
             Self::HttpFailed => Code::new("http-failed"),
+            Self::InvalidTimestamp => Code::new("invalid-timestamp"),
+            Self::PostRefused => Code::new("post-refused"),
         }
     }
 }

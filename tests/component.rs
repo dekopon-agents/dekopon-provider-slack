@@ -24,7 +24,8 @@ fn reply(value: Value) -> Response {
 fn manifest_declares_separate_canvas_capabilities() -> Result<(), Box<dyn std::error::Error>> {
     conformance::<Slack>(component())?;
     let manifest = provider::manifest::<Slack>()?;
-    assert_eq!(manifest.capabilities.len(), 2);
+    assert_eq!(manifest.capabilities.len(), 3);
+    assert_eq!(manifest.capabilities[2].id.as_str(), "slack.post");
     assert_eq!(manifest.capabilities[1].id.as_str(), "slack.canvas.replace");
     assert_eq!(manifest.capabilities[0].id.as_str(), "slack.canvas.lookup");
     assert_eq!(
@@ -67,6 +68,164 @@ fn lookup_proposes_typed_input_and_content_read_refuses() {
         provider::command::<Slack>(&["canvas".into(), "read".into()], false),
         CommandRunOutcome::Failed { .. }
     ));
+}
+
+#[test]
+fn post_proposes_typed_top_level_and_thread_inputs() {
+    for (argv, expected) in [
+        (
+            vec!["post", "C123", "hello"],
+            json!({"channel":"C123","text":"hello"}),
+        ),
+        (
+            vec!["post", "C123", "hello", "123.000001"],
+            json!({"channel":"C123","text":"hello","threadTs":"123.000001"}),
+        ),
+    ] {
+        let CommandRunOutcome::Proposed {
+            capability, input, ..
+        } = provider::command::<Slack>(
+            &argv.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+            false,
+        )
+        else {
+            panic!("post must propose")
+        };
+        assert_eq!(capability.as_str(), "slack.post");
+        assert_eq!(input, expected);
+    }
+}
+
+#[test]
+fn post_component_sends_one_bounded_message_without_canvas_settings()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (input, expected_body) in [
+        (
+            json!({"channel":"C123","text":"hello"}),
+            json!({"channel":"C123","text":"hello"}),
+        ),
+        (
+            json!({"channel":"C123","text":"hello","threadTs":"123.000001"}),
+            json!({"channel":"C123","text":"hello","thread_ts":"123.000001"}),
+        ),
+    ] {
+        let harness = Harness::<Slack>::get(component()).http(HttpScript::new(
+            "slack.com",
+            "POST",
+            reply(json!({"ok":true,"channel":"C123","ts":"124.000002"})),
+        ));
+        let origin = harness.origin().expect("script origin").to_owned();
+        let output = harness
+            .settings(json!({"baseUrl":origin}))
+            .call("slack.post", input)?;
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout)?,
+            json!({"channel":"C123","ts":"124.000002"})
+        );
+        assert_eq!(output.http_calls.len(), 1);
+        let request = output.http_request.as_ref().expect("one recorded request");
+        assert_eq!(request.uri, format!("{origin}/api/chat.postMessage"));
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body)?,
+            expected_body
+        );
+        assert!(
+            !request
+                .headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("authorization"))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn post_refusal_and_uncertain_response_never_retry() -> Result<(), Box<dyn std::error::Error>> {
+    for (body, code) in [
+        (
+            json!({"ok":false,"error":"not_in_channel"}),
+            "Slack refused the post",
+        ),
+        (
+            json!({"ok":true,"channel":"C123","ts":"broken"}),
+            "Slack result could not be verified",
+        ),
+        (json!({"ok":true,"channel":"C123"}), "unknown-result"),
+    ] {
+        let harness = Harness::<Slack>::get(component()).http(HttpScript::new(
+            "slack.com",
+            "POST",
+            reply(body),
+        ));
+        let origin = harness.origin().expect("script origin").to_owned();
+        let output = harness
+            .settings(json!({"baseUrl":origin}))
+            .call("slack.post", json!({"channel":"C123","text":"hello"}))?;
+        assert_eq!(output.status, 1);
+        assert!(output.stderr.contains(code), "{}", output.stderr);
+        assert_eq!(output.http_calls.len(), 1);
+        let request = output.http_request.as_ref().expect("one request");
+        assert_eq!(request.uri, format!("{origin}/api/chat.postMessage"));
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body)?,
+            json!({"channel":"C123","text":"hello"})
+        );
+        assert!(
+            !request
+                .headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("authorization"))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn native_post_requires_no_canvas_setting() -> Result<(), Box<dyn std::error::Error>> {
+    let native = Native::<Slack>::new().http(HttpScript::new(
+        "slack.com",
+        "POST",
+        reply(json!({"ok":true,"channel":"C123","ts":"124.000002"})),
+    ));
+    let output = native.call(
+        "slack.post",
+        &json!({"channel":"C123","text":"hello"}).to_string(),
+    );
+    assert_eq!(output.status, 0, "{}", output.stderr);
+    let requests = native.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].uri, "https://slack.com/api/chat.postMessage");
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&requests[0].body)?,
+        json!({"channel":"C123","text":"hello"})
+    );
+    assert!(
+        !requests[0]
+            .headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case("authorization"))
+    );
+    Ok(())
+}
+
+#[test]
+fn malformed_thread_timestamp_refuses_before_http() -> Result<(), Box<dyn std::error::Error>> {
+    let output = Harness::<Slack>::get(component()).call(
+        "slack.post",
+        json!({"channel":"C123","text":"hello","threadTs":"bad"}),
+    )?;
+    assert_eq!(output.status, 1);
+    assert!(
+        output.stderr.contains("invalid Slack thread timestamp"),
+        "{}",
+        output.stderr
+    );
+    assert!(output.http_calls.is_empty());
+    Ok(())
 }
 
 #[test]
