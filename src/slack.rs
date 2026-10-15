@@ -1,6 +1,6 @@
 use crate::{PostInput, SlackError};
 use dekopon_provider_sdk::provider::endpoint::Base;
-use dekopon_provider_sdk::provider::{Header, HttpError, Request, Response};
+use dekopon_provider_sdk::provider::{Header, HttpError, HttpErrorCode, Request, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -25,19 +25,42 @@ pub struct LookupResult {
     sections: Vec<Section>,
 }
 
+fn pre_send_error(code: HttpErrorCode) -> HttpError {
+    HttpError {
+        code,
+        message: String::new(),
+    }
+}
+
+fn write_error(error: HttpError) -> SlackError {
+    match error.code {
+        HttpErrorCode::Timeout
+        | HttpErrorCode::Protocol
+        | HttpErrorCode::ResponseTooLarge
+        | HttpErrorCode::Internal => SlackError::UnknownResult,
+        _ => SlackError::HttpFailed,
+    }
+}
+
 fn post(
     base: &Base,
     path: &str,
     body: Value,
     send: &mut impl FnMut(Request) -> Result<Response, HttpError>,
-) -> Result<Response, SlackError> {
-    let request = Request::new("POST", base.join(path).map_err(|_| SlackError::HttpFailed)?)
-        .map_err(|_| SlackError::HttpFailed)?
+) -> Result<Response, HttpError> {
+    let uri = base
+        .join(path)
+        .map_err(|_| pre_send_error(HttpErrorCode::InvalidUri))?;
+    let request = Request::new("POST", uri)
+        .map_err(|_| pre_send_error(HttpErrorCode::InvalidMethod))?
         .with_header(
-            Header::text("content-type", "application/json").map_err(|_| SlackError::HttpFailed)?,
+            Header::text("content-type", "application/json")
+                .map_err(|_| pre_send_error(HttpErrorCode::InvalidHeader))?,
         )
-        .with_body(serde_json::to_vec(&body).map_err(|_| SlackError::HttpFailed)?);
-    send(request).map_err(|_| SlackError::HttpFailed)
+        .with_body(
+            serde_json::to_vec(&body).map_err(|_| pre_send_error(HttpErrorCode::InvalidHeader))?,
+        );
+    send(request)
 }
 
 fn lookup_response(response: Response) -> Result<Vec<Section>, SlackError> {
@@ -69,7 +92,10 @@ fn lookup_sections(
     send: &mut impl FnMut(Request) -> Result<Response, HttpError>,
 ) -> Result<Vec<Section>, SlackError> {
     let body = json!({"canvas_id": canvas_id, "criteria": {"contains_text": text}});
-    lookup_response(post(base, "/api/canvases.sections.lookup", body, send)?)
+    lookup_response(
+        post(base, "/api/canvases.sections.lookup", body, send)
+            .map_err(|_| SlackError::HttpFailed)?,
+    )
 }
 
 pub fn lookup(
@@ -79,7 +105,7 @@ pub fn lookup(
     mut send: impl FnMut(Request) -> Result<Response, HttpError>,
 ) -> Result<LookupResult, SlackError> {
     if text.trim().is_empty() {
-        return Err(SlackError::NotFound);
+        return Err(SlackError::InvalidInput);
     }
     let sections = lookup_sections(base, canvas_id, text, &mut send)?;
     if sections.is_empty() {
@@ -140,7 +166,7 @@ pub fn replace(
     mut send: impl FnMut(Request) -> Result<Response, HttpError>,
 ) -> Result<ReplaceResult, SlackError> {
     if section_match.trim().is_empty() {
-        return Err(SlackError::NotFound);
+        return Err(SlackError::InvalidInput);
     }
     let line = markdown
         .lines()
@@ -149,8 +175,7 @@ pub fn replace(
     let verify_text: String = line.trim().chars().take(64).collect();
     let id = pre_edit(lookup_sections(base, canvas_id, section_match, &mut send)?)?;
     let body = json!({"canvas_id":canvas_id,"changes":[{"operation":"replace","section_id":id,"document_content":{"type":"markdown","markdown":markdown}}]});
-    let response =
-        post(base, "/api/canvases.edit", body, &mut send).map_err(|_| SlackError::UnknownResult)?;
+    let response = post(base, "/api/canvases.edit", body, &mut send).map_err(write_error)?;
     edit_response(response)?;
     let verification = post(
         base,
@@ -158,7 +183,7 @@ pub fn replace(
         json!({"canvas_id":canvas_id,"criteria":{"contains_text":verify_text}}),
         &mut send,
     )
-    .map_err(|_| SlackError::UnknownResult)?;
+    .map_err(write_error)?;
     verify_response(verification, &id)?;
     Ok(ReplaceResult {
         canvas_id: canvas_id.to_owned(),
@@ -196,8 +221,7 @@ pub fn post_message(
     if let Some(ts) = &input.thread_ts {
         body["thread_ts"] = json!(ts);
     }
-    let response = post(base, "/api/chat.postMessage", body, &mut send)
-        .map_err(|_| SlackError::UnknownResult)?;
+    let response = post(base, "/api/chat.postMessage", body, &mut send).map_err(write_error)?;
     if response.status != 200 {
         return Err(SlackError::UnknownResult);
     }
@@ -238,39 +262,48 @@ mod tests {
     }
 
     #[test]
-    fn post_timeout_after_send_is_unknown_without_retry() {
+    fn post_connect_refusal_is_http_failed_and_timeout_is_unknown_without_retry() {
         let base = Base::from_static("https://slack.com");
         let input = PostInput {
             channel: "C123".into(),
             text: "hello".into(),
             thread_ts: Some("123.000001".into()),
         };
-        let mut requests = Vec::new();
-        let result = post_message(&base, &input, |request| {
-            requests.push(request);
-            Err(HttpError {
-                code: dekopon_provider_sdk::provider::HttpErrorCode::Timeout,
-                message: "timed out after writing request".into(),
-            })
-        });
-        assert!(matches!(result, Err(SlackError::UnknownResult)));
-        assert_eq!(requests.len(), 1);
-        let request = &requests[0];
-        assert_eq!(request.method, "POST");
-        assert_eq!(
-            request.uri.as_str(),
-            "https://slack.com/api/chat.postMessage"
-        );
-        assert_eq!(
-            serde_json::from_slice::<Value>(&request.body).expect("body"),
-            json!({"channel":"C123","text":"hello","thread_ts":"123.000001"})
-        );
-        assert!(
-            !request
-                .headers
-                .iter()
-                .any(|h| h.name.eq_ignore_ascii_case("authorization"))
-        );
+        for (code, unknown) in [
+            (HttpErrorCode::Connect, false),
+            (HttpErrorCode::Timeout, true),
+        ] {
+            let mut requests = Vec::new();
+            let result = post_message(&base, &input, |request| {
+                requests.push(request);
+                Err(HttpError {
+                    code,
+                    message: "simulated failure".into(),
+                })
+            });
+            assert!(if unknown {
+                matches!(result, Err(SlackError::UnknownResult))
+            } else {
+                matches!(result, Err(SlackError::HttpFailed))
+            });
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert_eq!(request.method, "POST");
+            assert_eq!(
+                request.uri.as_str(),
+                "https://slack.com/api/chat.postMessage"
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&request.body).expect("body"),
+                json!({"channel":"C123","text":"hello","thread_ts":"123.000001"})
+            );
+            assert!(
+                !request
+                    .headers
+                    .iter()
+                    .any(|h| h.name.eq_ignore_ascii_case("authorization"))
+            );
+        }
     }
 
     #[test]
