@@ -238,6 +238,42 @@ mod tests {
     }
 
     #[test]
+    fn post_timeout_after_send_is_unknown_without_retry() {
+        let base = Base::from_static("https://slack.com");
+        let input = PostInput {
+            channel: "C123".into(),
+            text: "hello".into(),
+            thread_ts: Some("123.000001".into()),
+        };
+        let mut requests = Vec::new();
+        let result = post_message(&base, &input, |request| {
+            requests.push(request);
+            Err(HttpError {
+                code: dekopon_provider_sdk::provider::HttpErrorCode::Timeout,
+                message: "timed out after writing request".into(),
+            })
+        });
+        assert!(matches!(result, Err(SlackError::UnknownResult)));
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.uri.as_str(),
+            "https://slack.com/api/chat.postMessage"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body).expect("body"),
+            json!({"channel":"C123","text":"hello","thread_ts":"123.000001"})
+        );
+        assert!(
+            !request
+                .headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("authorization"))
+        );
+    }
+
+    #[test]
     fn sequence_failures_do_not_select_or_retry_a_section() {
         assert!(matches!(
             pre_edit(vec![Section { id: "a".into() }, Section { id: "b".into() }]),
