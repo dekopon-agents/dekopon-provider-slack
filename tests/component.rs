@@ -152,7 +152,10 @@ fn post_refusal_and_uncertain_response_never_retry() -> Result<(), Box<dyn std::
             json!({"ok":true,"channel":"C123","ts":"broken"}),
             "Slack result could not be verified",
         ),
-        (json!({"ok":true,"channel":"C123"}), "unknown-result"),
+        (
+            json!({"ok":true,"channel":"C123"}),
+            "Slack result could not be verified",
+        ),
     ] {
         let harness = Harness::<Slack>::get(component()).http(HttpScript::new(
             "slack.com",
