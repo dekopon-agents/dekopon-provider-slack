@@ -22,6 +22,15 @@ pub struct SlackSettings {
     base_url: Base,
 }
 
+impl SlackSettings {
+    fn canvas_id(&self) -> Result<&str, SlackError> {
+        if self.canvas_id.trim().is_empty() {
+            return Err(SlackError::InvalidSettings);
+        }
+        Ok(&self.canvas_id)
+    }
+}
+
 fn default_base() -> Base {
     Base::from_static("https://slack.com")
 }
@@ -95,13 +104,10 @@ impl Capability for Lookup {
         out: &mut Stdout,
     ) -> Result<(), Self::Error> {
         let settings = settings.into_inner();
-        let canvas_id = settings.canvas_id;
-        if canvas_id.trim().is_empty() {
-            return Err(SlackError::InvalidSettings);
-        }
+        let canvas_id = settings.canvas_id()?;
         let result = slack::lookup(
             &settings.base_url,
-            &canvas_id,
+            canvas_id,
             &input.contains_text,
             |request| http.send(request),
         )?;
@@ -140,6 +146,21 @@ impl Failure for SlackError {
             Self::AccessDenied => Code::new("access-denied"),
             Self::HttpFailed => Code::new("http-failed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SlackError, SlackSettings};
+    use dekopon_provider_sdk::provider::{Code, Failure};
+
+    #[test]
+    fn empty_canvas_setting_returns_typed_invalid_settings() {
+        let settings: SlackSettings =
+            serde_json::from_str(r#"{"canvasId":""}"#).expect("settings shape");
+        let error = settings.canvas_id().expect_err("empty canvas ID");
+        assert!(matches!(error, SlackError::InvalidSettings));
+        assert_eq!(error.code(), Code::INVALID_SETTINGS);
     }
 }
 
