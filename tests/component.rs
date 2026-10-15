@@ -315,9 +315,10 @@ fn native_replace_sends_one_section_edit_and_one_verification()
             "POST",
             reply(json!({"ok":true,"sections":[{"id":"one"}]})),
         ));
+    let markdown = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789--EXTRA\nnext";
     let output = native.call(
         "slack.canvas.replace",
-        &json!({"sectionMatch":"Status","markdown":"New first line\nnext"}).to_string(),
+        &json!({"sectionMatch":"Status","markdown":markdown}).to_string(),
     );
     assert_eq!(output.status, 0, "{}", output.stderr);
     assert_eq!(
@@ -351,11 +352,11 @@ fn native_replace_sends_one_section_edit_and_one_verification()
     let edit: Value = serde_json::from_slice(&requests[1].body)?;
     assert_eq!(
         edit,
-        json!({"canvas_id":CANVAS,"changes":[{"operation":"replace","section_id":"one","document_content":{"type":"markdown","markdown":"New first line\nnext"}}]})
+        json!({"canvas_id":CANVAS,"changes":[{"operation":"replace","section_id":"one","document_content":{"type":"markdown","markdown":markdown}}]})
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&requests[2].body)?,
-        json!({"canvas_id":CANVAS,"criteria":{"contains_text":"New first line"}})
+        json!({"canvas_id":CANVAS,"criteria":{"contains_text":"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789--"}})
     );
     // Synthetic document: apply only the section-scoped change, not a live Slack preservation claim.
     let mut document = json!([{"id":"before","markdown":"keep"},{"id":"one","markdown":"old"},{"id":"after","markdown":"keep"}]);
@@ -364,6 +365,6 @@ fn native_replace_sends_one_section_edit_and_one_verification()
     assert_eq!(change["section_id"], document[1]["id"]);
     document[1]["markdown"] = change["document_content"]["markdown"].clone();
     assert_eq!([document[0].clone(), document[2].clone()], untouched);
-    assert_eq!(document[1]["markdown"], "New first line\nnext");
+    assert_eq!(document[1]["markdown"], markdown);
     Ok(())
 }
