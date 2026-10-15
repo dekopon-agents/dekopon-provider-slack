@@ -71,9 +71,9 @@ fn deserialize_base<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Base, 
 impl Provider for Slack {
     const ID: &'static str = "slack";
     const COMMAND_WORDS: &'static [&'static str] = &["slack"];
-    const DESCRIPTION: &'static str = "Narrow Slack canvas section lookup";
+    const DESCRIPTION: &'static str = "Narrow Slack canvas section operations";
     type Args = commands::Args;
-    type Capabilities = (Lookup,);
+    type Capabilities = (Lookup, Replace);
 
     fn propose(args: Self::Args, _stdin_piped: bool) -> Result<Proposal<Self>, Usage> {
         commands::propose(args)
@@ -118,11 +118,54 @@ impl Capability for Lookup {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReplaceInput {
+    pub section_match: String,
+    pub markdown: String,
+}
+
+pub struct Replace;
+impl Capability for Replace {
+    type Provider = Slack;
+    const NAME: &'static str = "canvas.replace";
+    const DESCRIPTION: &'static str =
+        "Replace one freshly looked-up section on the owner-pinned canvas";
+    const EFFECT: EffectKind = EffectKind::ExternalWrite;
+    const RISK: RiskLevel = RiskLevel::High;
+    type Input = ReplaceInput;
+    type Needs = (Settings<SlackSettings>, Http);
+    type Error = SlackError;
+
+    fn run(
+        input: Self::Input,
+        (settings, http): Self::Needs,
+        out: &mut Stdout,
+    ) -> Result<(), Self::Error> {
+        let settings = settings.into_inner();
+        let result = slack::replace(
+            &settings.base_url,
+            settings.canvas_id()?,
+            &input.section_match,
+            &input.markdown,
+            |request| http.send(request),
+        )?;
+        serde_json::to_writer(&mut *out, &result).map_err(|_| SlackError::InvalidResponse)?;
+        out.write_all(b"\n")
+            .map_err(|_| SlackError::InvalidResponse)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub enum SlackError {
     InvalidSettings,
+    InvalidInput,
     InvalidResponse,
     NotFound,
+    Ambiguous,
+    Conflict,
+    UnknownResult,
     AccessDenied,
     HttpFailed,
 }
@@ -130,8 +173,12 @@ impl fmt::Display for SlackError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::InvalidSettings => "canvas settings are invalid",
+            Self::InvalidInput => "markdown must have a non-empty line",
             Self::InvalidResponse => "Slack returned an invalid response",
             Self::NotFound => "no matching section or canvas not available",
+            Self::Ambiguous => "more than one section matched",
+            Self::Conflict => "canvas section edit conflicts with current state",
+            Self::UnknownResult => "canvas edit result could not be verified",
             Self::AccessDenied => "canvas not accessible to this credential",
             Self::HttpFailed => "Slack request failed",
         })
@@ -141,8 +188,12 @@ impl Failure for SlackError {
     fn code(&self) -> Code {
         match self {
             Self::InvalidSettings => Code::INVALID_SETTINGS,
+            Self::InvalidInput => Code::new("invalid-input"),
             Self::InvalidResponse => Code::new("invalid-response"),
             Self::NotFound => Code::new("not-found"),
+            Self::Ambiguous => Code::new("ambiguous"),
+            Self::Conflict => Code::new("conflict"),
+            Self::UnknownResult => Code::new("unknown-result"),
             Self::AccessDenied => Code::new("access-denied"),
             Self::HttpFailed => Code::new("http-failed"),
         }
