@@ -228,7 +228,7 @@ impl Failure for SlackError {
     fn code(&self) -> Code {
         match self {
             Self::InvalidSettings => Code::INVALID_SETTINGS,
-            Self::InvalidInput => Code::new("invalid-input"),
+            Self::InvalidInput => Code::INVALID_INPUT,
             Self::InvalidResponse => Code::new("invalid-response"),
             Self::NotFound => Code::new("not-found"),
             Self::Ambiguous => Code::new("ambiguous"),

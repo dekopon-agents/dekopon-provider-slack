@@ -10,7 +10,7 @@ The Slack provider is a Wasm component with separately granted capabilities. Rea
 
 ## Build and verify
 
-A PR passes `ci / validate` from [provider-workflows](https://github.com/dekopon-agents/provider-workflows). Run its steps before a push:
+A PR passes `ci / validate` from [provider-workflows](https://github.com/dekopon-agents/provider-workflows). Run its steps and the local rustdoc gate before a push:
 
 ```console
 git clone --depth 1 https://github.com/dekopon-agents/provider-workflows ../provider-workflows
@@ -20,8 +20,9 @@ cargo clippy --locked -p dekopon-slack-provider --all-targets -- -D warnings
 cargo clippy --locked -p dekopon-slack-provider --lib --target wasm32-unknown-unknown -- -D warnings
 ../provider-workflows/build.sh
 DEKOPON_PROVIDER_COMPONENT="$PWD/slack-provider.wasm" cargo test --locked -p dekopon-slack-provider
-RUSTDOCFLAGS="-D warnings" cargo doc --locked -p dekopon-slack-provider --no-deps
 ```
+
+Local gate (not part of `ci / validate`): `RUSTDOCFLAGS="-D warnings" cargo doc --locked -p dekopon-slack-provider --no-deps`.
 
 Pins are exact (`rust-toolchain.toml`, wasm-tools 1.259.0); build.sh asserts reproducible bytes. Tests use offline decoded JSON fixtures, not live Slack.
 

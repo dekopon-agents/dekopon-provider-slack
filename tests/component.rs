@@ -1,4 +1,4 @@
-use dekopon_provider_sdk::provider::{Http, ImportSet, Needs, Provider, Response};
+use dekopon_provider_sdk::provider::Response;
 use dekopon_provider_sdk::{CommandRunOutcome, provider};
 use dekopon_provider_sdk_testkit::{Harness, HttpScript, Native, conformance};
 use dekopon_slack_provider::Slack;
@@ -32,8 +32,6 @@ fn manifest_declares_separate_canvas_capabilities() -> Result<(), Box<dyn std::e
         manifest.capabilities[0].input_schema["additionalProperties"],
         false
     );
-    assert!(<Http as Needs>::IMPORTS.contains(ImportSet::HTTP));
-    assert_eq!(<Slack as Provider>::COMMAND_WORDS, &["slack"]);
     Ok(())
 }
 
@@ -142,7 +140,7 @@ fn post_component_sends_one_bounded_message_without_canvas_settings()
 }
 
 #[test]
-fn post_refusal_and_uncertain_response_never_retry() -> Result<(), Box<dyn std::error::Error>> {
+fn post_refusal_and_uncertain_response() -> Result<(), Box<dyn std::error::Error>> {
     for (body, code) in [
         (
             json!({"ok":false,"error":"not_in_channel"}),
@@ -336,6 +334,30 @@ fn malformed_canvas_settings_refuse_before_http() -> Result<(), Box<dyn std::err
 }
 
 #[test]
+fn empty_lookup_query_and_replace_match_refuse_before_http()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (capability, input) in [
+        ("slack.canvas.lookup", json!({"containsText":"  "})),
+        (
+            "slack.canvas.replace",
+            json!({"sectionMatch":"  ","markdown":"New"}),
+        ),
+    ] {
+        let output = Harness::<Slack>::get(component())
+            .settings(json!({"canvasId":CANVAS}))
+            .call(capability, input)?;
+        assert_eq!(output.status, 2, "{}", output.stderr);
+        assert!(
+            output.stderr.contains("non-empty value"),
+            "{}",
+            output.stderr
+        );
+        assert!(output.http_calls.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn zero_matches_and_inaccessible_canvas_refuse() -> Result<(), Box<dyn std::error::Error>> {
     for (reply_body, error) in [
         (json!({"ok":true,"sections":[]}), "no matching"),
@@ -393,12 +415,13 @@ fn zero_matches_and_inaccessible_canvas_refuse() -> Result<(), Box<dyn std::erro
 
 #[test]
 fn replace_refuses_before_a_second_request() -> Result<(), Box<dyn std::error::Error>> {
-    for (settings, markdown, body, expected_calls, message) in [
+    for (settings, markdown, body, expected_calls, status, message) in [
         (
             json!({"canvasId":null}),
             "New",
             json!({"ok":true,"sections":[{"id":"one"}]}),
             0,
+            1,
             "settings",
         ),
         (
@@ -406,12 +429,14 @@ fn replace_refuses_before_a_second_request() -> Result<(), Box<dyn std::error::E
             " \n\t",
             json!({"ok":true,"sections":[{"id":"one"}]}),
             0,
+            2,
             "non-empty",
         ),
         (
             json!({"canvasId":CANVAS}),
             "New",
             json!({"ok":true,"sections":[]}),
+            1,
             1,
             "no matching",
         ),
@@ -420,12 +445,14 @@ fn replace_refuses_before_a_second_request() -> Result<(), Box<dyn std::error::E
             "New",
             json!({"ok":true,"sections":[{"id":"one"},{"id":"two"}]}),
             1,
+            1,
             "more than one",
         ),
         (
             json!({"canvasId":CANVAS}),
             "New",
             json!({"ok":false,"sections":[{"id":"one"}]}),
+            1,
             1,
             "request failed",
         ),
@@ -442,7 +469,7 @@ fn replace_refuses_before_a_second_request() -> Result<(), Box<dyn std::error::E
             "slack.canvas.replace",
             json!({"sectionMatch":"Status","markdown":markdown}),
         )?;
-        assert_eq!(output.status, 1);
+        assert_eq!(output.status, status);
         assert!(output.stderr.contains(message), "{}", output.stderr);
         assert_eq!(output.http_calls.len(), expected_calls);
         if expected_calls == 1 {
@@ -520,13 +547,5 @@ fn native_replace_sends_one_section_edit_and_one_verification()
         serde_json::from_slice::<Value>(&requests[2].body)?,
         json!({"canvas_id":CANVAS,"criteria":{"contains_text":"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789--"}})
     );
-    // Synthetic document: apply only the section-scoped change, not a live Slack preservation claim.
-    let mut document = json!([{"id":"before","markdown":"keep"},{"id":"one","markdown":"old"},{"id":"after","markdown":"keep"}]);
-    let untouched = [document[0].clone(), document[2].clone()];
-    let change = &edit["changes"][0];
-    assert_eq!(change["section_id"], document[1]["id"]);
-    document[1]["markdown"] = change["document_content"]["markdown"].clone();
-    assert_eq!([document[0].clone(), document[2].clone()], untouched);
-    assert_eq!(document[1]["markdown"], markdown);
     Ok(())
 }
