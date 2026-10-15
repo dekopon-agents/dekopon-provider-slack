@@ -38,7 +38,15 @@ fn write_error(error: HttpError) -> SlackError {
         | HttpErrorCode::Protocol
         | HttpErrorCode::ResponseTooLarge
         | HttpErrorCode::Internal => SlackError::UnknownResult,
-        _ => SlackError::HttpFailed,
+        HttpErrorCode::InvalidMethod
+        | HttpErrorCode::InvalidUri
+        | HttpErrorCode::InvalidHeader
+        | HttpErrorCode::RequestTooLarge
+        | HttpErrorCode::Denied
+        | HttpErrorCode::HostCallLimit
+        | HttpErrorCode::Dns
+        | HttpErrorCode::Connect
+        | HttpErrorCode::Tls => SlackError::HttpFailed,
     }
 }
 
@@ -183,7 +191,7 @@ pub fn replace(
         json!({"canvas_id":canvas_id,"criteria":{"contains_text":verify_text}}),
         &mut send,
     )
-    .map_err(write_error)?;
+    .map_err(|_| SlackError::UnknownResult)?;
     verify_response(verification, &id)?;
     Ok(ReplaceResult {
         canvas_id: canvas_id.to_owned(),
@@ -303,6 +311,35 @@ mod tests {
                     .iter()
                     .any(|h| h.name.eq_ignore_ascii_case("authorization"))
             );
+        }
+    }
+
+    #[test]
+    fn verification_connect_refusal_after_accepted_edit_is_unknown_without_retry() {
+        let base = Base::from_static("https://slack.com");
+        let mut requests = Vec::new();
+        let result = replace(&base, "canvas", "old", "new", |request| {
+            requests.push(request);
+            match requests.len() {
+                1 => Ok(response(json!({"ok":true,"sections":[{"id":"one"}]}))),
+                2 => Ok(response(json!({"ok":true}))),
+                _ => Err(HttpError {
+                    code: HttpErrorCode::Connect,
+                    message: "connection refused".into(),
+                }),
+            }
+        });
+        assert!(matches!(result, Err(SlackError::UnknownResult)));
+        assert_eq!(requests.len(), 3);
+        for (request, (path, body)) in requests.iter().zip([
+            ("/api/canvases.sections.lookup", json!({"canvas_id":"canvas","criteria":{"contains_text":"old"}})),
+            ("/api/canvases.edit", json!({"canvas_id":"canvas","changes":[{"operation":"replace","section_id":"one","document_content":{"type":"markdown","markdown":"new"}}]})),
+            ("/api/canvases.sections.lookup", json!({"canvas_id":"canvas","criteria":{"contains_text":"new"}})),
+        ]) {
+            assert_eq!(request.uri, format!("https://slack.com{path}"));
+            assert_eq!(request.method, "POST");
+            assert_eq!(serde_json::from_slice::<Value>(&request.body).expect("body"), body);
+            assert!(!request.headers.iter().any(|h| h.name.eq_ignore_ascii_case("authorization")));
         }
     }
 
