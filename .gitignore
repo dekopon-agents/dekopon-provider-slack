@@ -1,0 +1,3 @@
+target/
+slack-provider.wasm
+slack-provider.wasm.sha256
