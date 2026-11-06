@@ -5,7 +5,7 @@ use dekopon_provider_sdk_testkit::{Harness, HarnessError, HttpScript, Native, co
 use dekopon_slack_provider::Slack;
 use serde_json::{Value, json};
 
-const CANVAS: &str = "F0C907QUHU7";
+const CANVAS: &str = "F0SYNTHCANVAS";
 
 fn component() -> std::path::PathBuf {
     std::env::var_os("DEKOPON_PROVIDER_COMPONENT")
@@ -64,7 +64,7 @@ fn manifest_declares_four_separate_capabilities_with_a_closed_read_only_read()
 }
 
 #[test]
-fn canvas_verbs_propose_typed_inputs_and_read_takes_no_arguments() {
+fn native_canvas_verbs_propose_typed_inputs_and_read_takes_no_arguments() {
     let args = ["canvas", "lookup", "Status"].map(str::to_owned);
     let CommandRunOutcome::Proposed {
         capability, input, ..
