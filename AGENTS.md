@@ -5,7 +5,7 @@ The Slack provider is a Wasm component with separately granted capabilities. Rea
 ## Boundaries
 
 - The guest never sets authorization; the broker injects destination-bound credentials at the native HTTP boundary. Never put token bytes in input, output or errors.
-- The canvas ID and optional HTTPS DNS-only `baseUrl` are owner settings, not model input. Production omits `baseUrl`. A grant to lookup is not a grant to replace or post. Content read is held. No generic Slack API passthrough.
+- The canvas ID and optional HTTPS DNS-only `baseUrl` are owner settings, not model input. Production omits `baseUrl`. A grant to lookup, read, replace or post grants none of the others. Content read is one separately granted whole-canvas `canvases.getContent` on the pinned canvas. No generic Slack API passthrough.
 - A canvas write must name one freshly looked-up section ID. No standalone or whole-canvas edits. Provider code alone is not the fixed-ID broker fence.
 
 ## Build and verify

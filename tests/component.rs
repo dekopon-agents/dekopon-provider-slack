@@ -1,15 +1,32 @@
-use dekopon_provider_sdk::provider::Response;
-use dekopon_provider_sdk::{CommandRunOutcome, provider};
-use dekopon_provider_sdk_testkit::{Harness, HttpScript, Native, conformance};
+use dekopon_broker_host::BrokerHostError;
+use dekopon_provider_sdk::provider::{Request, Response};
+use dekopon_provider_sdk::{CommandRunOutcome, EffectKind, provider};
+use dekopon_provider_sdk_testkit::{Harness, HarnessError, HttpScript, Native, conformance};
 use dekopon_slack_provider::Slack;
 use serde_json::{Value, json};
 
-const CANVAS: &str = "F0C907QUHU7";
+const CANVAS: &str = "F0SYNTHCANVAS";
 
 fn component() -> std::path::PathBuf {
     std::env::var_os("DEKOPON_PROVIDER_COMPONENT")
         .expect("DEKOPON_PROVIDER_COMPONENT must name the freshly built component")
         .into()
+}
+
+fn assert_read_request(request: &Request, origin: &str) -> Result<(), serde_json::Error> {
+    assert_eq!(request.uri, format!("{origin}/api/canvases.getContent"));
+    assert_eq!(request.method, "POST");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&request.body)?,
+        json!({"canvas_id":CANVAS,"content_type":"markdown"})
+    );
+    assert!(
+        !request
+            .headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case("authorization"))
+    );
+    Ok(())
 }
 
 fn reply(value: Value) -> Response {
@@ -21,10 +38,21 @@ fn reply(value: Value) -> Response {
 }
 
 #[test]
-fn manifest_declares_separate_canvas_capabilities() -> Result<(), Box<dyn std::error::Error>> {
+fn manifest_declares_four_separate_capabilities_with_a_closed_read_only_read()
+-> Result<(), Box<dyn std::error::Error>> {
     conformance::<Slack>(component())?;
     let manifest = provider::manifest::<Slack>()?;
-    assert_eq!(manifest.capabilities.len(), 3);
+    assert_eq!(manifest.capabilities.len(), 4);
+    let read = &manifest.capabilities[3];
+    assert_eq!(read.id.as_str(), "slack.canvas.read");
+    assert_eq!(read.effect, EffectKind::ReadOnly);
+    assert_eq!(read.input_schema["type"], "object");
+    assert_eq!(read.input_schema["additionalProperties"], false);
+    assert!(
+        read.input_schema
+            .get("properties")
+            .is_none_or(|properties| properties == &json!({}))
+    );
     assert_eq!(manifest.capabilities[2].id.as_str(), "slack.post");
     assert_eq!(manifest.capabilities[1].id.as_str(), "slack.canvas.replace");
     assert_eq!(manifest.capabilities[0].id.as_str(), "slack.canvas.lookup");
@@ -36,7 +64,7 @@ fn manifest_declares_separate_canvas_capabilities() -> Result<(), Box<dyn std::e
 }
 
 #[test]
-fn lookup_proposes_typed_input_and_content_read_refuses() {
+fn native_canvas_verbs_propose_typed_inputs_and_read_takes_no_arguments() {
     let args = ["canvas", "lookup", "Status"].map(str::to_owned);
     let CommandRunOutcome::Proposed {
         capability, input, ..
@@ -62,10 +90,22 @@ fn lookup_proposes_typed_input_and_content_read_refuses() {
     };
     assert_eq!(capability.as_str(), "slack.canvas.replace");
     assert_eq!(input, json!({"sectionMatch":"Status","markdown":"New"}));
-    assert!(matches!(
-        provider::command::<Slack>(&["canvas".into(), "read".into()], false),
-        CommandRunOutcome::Failed { .. }
-    ));
+    let CommandRunOutcome::Proposed {
+        capability, input, ..
+    } = provider::command::<Slack>(&["canvas".into(), "read".into()], false)
+    else {
+        panic!("read must propose")
+    };
+    assert_eq!(capability.as_str(), "slack.canvas.read");
+    assert_eq!(input, json!({}));
+    let CommandRunOutcome::Rendered { stdout, status, .. } = provider::command::<Slack>(
+        &["canvas".into(), "read".into(), "temp:C:one".into()],
+        false,
+    ) else {
+        panic!("read with an argument must be a usage rejection")
+    };
+    assert_eq!(status, 2);
+    assert!(stdout.is_empty());
 }
 
 #[test]
@@ -141,7 +181,7 @@ fn post_component_sends_one_bounded_message_without_canvas_settings()
 
 #[test]
 fn post_refusal_and_uncertain_response() -> Result<(), Box<dyn std::error::Error>> {
-    for (body, code) in [
+    for (body, message) in [
         (
             json!({"ok":false,"error":"not_in_channel"}),
             "Slack refused the post",
@@ -165,7 +205,7 @@ fn post_refusal_and_uncertain_response() -> Result<(), Box<dyn std::error::Error
             .settings(json!({"baseUrl":origin}))
             .call("slack.post", json!({"channel":"C123","text":"hello"}))?;
         assert_eq!(output.status, 1);
-        assert!(output.stderr.contains(code), "{}", output.stderr);
+        assert_eq!(output.stderr, format!("{message}\n"));
         assert_eq!(output.http_calls.len(), 1);
         let request = output.http_request.as_ref().expect("one request");
         assert_eq!(request.uri, format!("{origin}/api/chat.postMessage"));
@@ -547,5 +587,148 @@ fn native_replace_sends_one_section_edit_and_one_verification()
         serde_json::from_slice::<Value>(&requests[2].body)?,
         json!({"canvas_id":CANVAS,"criteria":{"contains_text":"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789--"}})
     );
+    Ok(())
+}
+
+#[test]
+fn read_sends_one_markdown_get_content_for_the_pinned_canvas_and_writes_its_markdown()
+-> Result<(), Box<dyn std::error::Error>> {
+    let markdown = "# Plan\n## Status\nStatus: amber, synthetic.";
+    let harness = Harness::<Slack>::get(component()).http(HttpScript::new(
+        "slack.com",
+        "POST",
+        reply(json!({"ok":true,"content":markdown})),
+    ));
+    let origin = harness.origin().expect("script origin").to_owned();
+    let output = harness
+        .settings(json!({"canvasId":CANVAS,"baseUrl":origin}))
+        .call("slack.canvas.read", json!({}))?;
+    assert_eq!(output.status, 0, "{}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        format!("{}\n", json!({"canvasId":CANVAS,"markdown":markdown})).into_bytes()
+    );
+    assert_eq!(output.http_calls.len(), 1);
+    assert_read_request(output.http_request.as_ref().expect("one request"), &origin)?;
+    Ok(())
+}
+
+#[test]
+fn read_refusals_fail_with_their_message_empty_stdout_and_one_request()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (status, body, message) in [
+        (
+            500,
+            json!({"ok":true,"content":"x"}).to_string(),
+            "Slack request failed",
+        ),
+        (
+            200,
+            json!({"ok":false,"error":"ratelimited"}).to_string(),
+            "Slack request failed",
+        ),
+        (
+            200,
+            json!({"ok":false,"error":"canvas_not_found"}).to_string(),
+            "no matching section or canvas not available",
+        ),
+        (
+            200,
+            json!({"ok":false,"error":"canvas_deleted"}).to_string(),
+            "no matching section or canvas not available",
+        ),
+        (
+            200,
+            json!({"ok":false,"error":"access_denied"}).to_string(),
+            "canvas not accessible to this credential",
+        ),
+        (
+            200,
+            json!({"ok":false,"error":"missing_scope"}).to_string(),
+            "canvas not accessible to this credential",
+        ),
+        (
+            200,
+            json!({"ok":false,"error":"canvas_disabled_user_team"}).to_string(),
+            "canvas not accessible to this credential",
+        ),
+        (
+            200,
+            "not json".to_owned(),
+            "Slack returned an invalid response",
+        ),
+        (
+            200,
+            json!({"ok":true}).to_string(),
+            "Slack returned an invalid response",
+        ),
+    ] {
+        let harness = Harness::<Slack>::get(component()).http(HttpScript::new(
+            "slack.com",
+            "POST",
+            Response {
+                status,
+                headers: vec![],
+                body: body.into_bytes(),
+            },
+        ));
+        let origin = harness.origin().expect("script origin").to_owned();
+        let output = harness
+            .settings(json!({"canvasId":CANVAS,"baseUrl":origin}))
+            .call("slack.canvas.read", json!({}))?;
+        assert_eq!(output.status, 1);
+        assert_eq!(output.stderr, format!("{message}\n"));
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.http_calls.len(), 1);
+        assert_read_request(output.http_request.as_ref().expect("one request"), &origin)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn read_over_the_harness_response_cap_is_rejected_by_the_host_not_returned()
+-> Result<(), Box<dyn std::error::Error>> {
+    let content = "a".repeat(70 * 1024);
+    let harness = Harness::<Slack>::get(component()).http(HttpScript::new(
+        "slack.com",
+        "POST",
+        reply(json!({"ok":true,"content":content})),
+    ));
+    let origin = harness.origin().expect("script origin").to_owned();
+    let result = harness
+        .settings(json!({"canvasId":CANVAS,"baseUrl":origin}))
+        .call("slack.canvas.read", json!({}));
+    let Err(HarnessError::Invocation(failure)) = result else {
+        panic!("an over-cap read must be a host rejection")
+    };
+    let BrokerHostError::HostCallRejected {
+        capability, reason, ..
+    } = *failure.error
+    else {
+        panic!("an over-cap read must be HostCallRejected")
+    };
+    assert_eq!(capability.as_str(), "slack.canvas.read");
+    assert_eq!(reason, "byte-limit");
+    assert_eq!(failure.http_calls.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn read_without_a_canvas_setting_refuses_before_http() -> Result<(), Box<dyn std::error::Error>> {
+    for settings in [
+        None,
+        Some(json!({"canvasId":null})),
+        Some(json!({"canvasId":""})),
+    ] {
+        let mut harness = Harness::<Slack>::get(component());
+        if let Some(settings) = settings {
+            harness = harness.settings(settings);
+        }
+        let output = harness.call("slack.canvas.read", json!({}))?;
+        assert_eq!(output.status, 1);
+        assert_eq!(output.stderr, "canvas settings are invalid\n");
+        assert!(output.stdout.is_empty());
+        assert!(output.http_calls.is_empty());
+    }
     Ok(())
 }

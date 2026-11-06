@@ -71,6 +71,16 @@ fn post(
     send(request)
 }
 
+fn canvas_refusal(error: Option<&str>) -> SlackError {
+    match error {
+        Some("canvas_not_found" | "canvas_deleted") => SlackError::NotFound,
+        Some("access_denied" | "missing_scope" | "canvas_disabled_user_team") => {
+            SlackError::AccessDenied
+        }
+        _ => SlackError::HttpFailed,
+    }
+}
+
 fn lookup_response(response: Response) -> Result<Vec<Section>, SlackError> {
     if response.status != 200 {
         return Err(SlackError::HttpFailed);
@@ -78,13 +88,7 @@ fn lookup_response(response: Response) -> Result<Vec<Section>, SlackError> {
     let reply: Reply =
         serde_json::from_slice(&response.body).map_err(|_| SlackError::InvalidResponse)?;
     if !reply.ok {
-        return Err(match reply.error.as_deref() {
-            Some("canvas_not_found" | "canvas_deleted") => SlackError::NotFound,
-            Some("access_denied" | "missing_scope" | "canvas_disabled_user_team") => {
-                SlackError::AccessDenied
-            }
-            _ => SlackError::HttpFailed,
-        });
+        return Err(canvas_refusal(reply.error.as_deref()));
     }
     let sections = reply.sections.ok_or(SlackError::InvalidResponse)?;
     if sections.iter().any(|section| section.id.is_empty()) {
@@ -199,6 +203,53 @@ pub fn replace(
     })
 }
 
+#[derive(Deserialize)]
+struct ContentReply {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    content: Option<Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadResult {
+    canvas_id: String,
+    markdown: String,
+}
+
+fn read_error(error: HttpError) -> SlackError {
+    match error.code {
+        HttpErrorCode::ResponseTooLarge => SlackError::TooLarge,
+        _ => SlackError::HttpFailed,
+    }
+}
+
+pub fn read(
+    base: &Base,
+    canvas_id: &str,
+    mut send: impl FnMut(Request) -> Result<Response, HttpError>,
+) -> Result<ReadResult, SlackError> {
+    let body = json!({"canvas_id": canvas_id, "content_type": "markdown"});
+    let response = post(base, "/api/canvases.getContent", body, &mut send).map_err(read_error)?;
+    if response.status != 200 {
+        return Err(SlackError::HttpFailed);
+    }
+    let reply: ContentReply =
+        serde_json::from_slice(&response.body).map_err(|_| SlackError::InvalidResponse)?;
+    if !reply.ok {
+        return Err(canvas_refusal(reply.error.as_deref()));
+    }
+    match reply.content {
+        Some(Value::String(markdown)) => Ok(ReadResult {
+            canvas_id: canvas_id.to_owned(),
+            markdown,
+        }),
+        _ => Err(SlackError::InvalidResponse),
+    }
+}
+
 #[derive(Serialize)]
 pub struct PostResult {
     channel: String,
@@ -270,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn post_connect_refusal_is_http_failed_and_timeout_is_unknown_without_retry() {
+    fn native_post_connect_refusal_is_http_failed_and_timeout_is_unknown_without_retry() {
         let base = Base::from_static("https://slack.com");
         let input = PostInput {
             channel: "C123".into(),
@@ -315,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn verification_connect_refusal_after_accepted_edit_is_unknown_without_retry() {
+    fn native_verification_connect_refusal_after_accepted_edit_is_unknown_without_retry() {
         let base = Base::from_static("https://slack.com");
         let mut requests = Vec::new();
         let result = replace(&base, "canvas", "old", "new", |request| {
@@ -344,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn sequence_failures_do_not_select_or_retry_a_section() {
+    fn native_sequence_failures_do_not_select_or_retry_a_section() {
         assert!(matches!(
             pre_edit(vec![Section { id: "a".into() }, Section { id: "b".into() }]),
             Err(SlackError::Ambiguous)
@@ -383,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_stops_after_sequence_failure_without_retry() {
+    fn native_replace_stops_after_sequence_failure_without_retry() {
         let base = Base::from_static("https://slack.com");
         for (edit, verification, count, conflict) in [
             (
@@ -416,18 +467,227 @@ mod tests {
                 edit,
                 verification,
             ];
-            let mut calls = 0;
-            let result = replace(&base, "canvas", "old", "new", |_| {
-                let result = response(replies[calls].clone());
-                calls += 1;
-                Ok(result)
+            let mut requests = Vec::new();
+            let result = replace(&base, "canvas", "old", "new", |request| {
+                let reply = response(replies[requests.len()].clone());
+                requests.push(request);
+                Ok(reply)
             });
             if conflict {
                 assert!(matches!(result, Err(SlackError::Conflict)));
             } else {
                 assert!(matches!(result, Err(SlackError::UnknownResult)));
             }
-            assert_eq!(calls, count);
+            assert_eq!(requests.len(), count);
+            for (request, (path, body)) in requests.iter().zip([
+                ("/api/canvases.sections.lookup", json!({"canvas_id":"canvas","criteria":{"contains_text":"old"}})),
+                ("/api/canvases.edit", json!({"canvas_id":"canvas","changes":[{"operation":"replace","section_id":"one","document_content":{"type":"markdown","markdown":"new"}}]})),
+                ("/api/canvases.sections.lookup", json!({"canvas_id":"canvas","criteria":{"contains_text":"new"}})),
+            ]) {
+                assert_request(request, path, &body);
+            }
+        }
+    }
+
+    fn assert_request(request: &Request, path: &str, body: &Value) {
+        assert_eq!(request.uri, format!("https://slack.com{path}"));
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            &serde_json::from_slice::<Value>(&request.body).expect("body"),
+            body
+        );
+        assert!(
+            !request
+                .headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("authorization"))
+        );
+    }
+
+    fn status(code: u16, body: &str) -> Response {
+        Response {
+            status: code,
+            headers: vec![],
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn native_read_sends_one_markdown_get_content_and_maps_each_refusal_to_its_typed_code() {
+        use std::mem::discriminant;
+        let base = Base::from_static("https://slack.com");
+        let cases: [(Result<Response, HttpErrorCode>, SlackError, &str); 13] = [
+            (
+                Ok(status(500, r#"{"ok":true,"content":"x"}"#)),
+                SlackError::HttpFailed,
+                "http-failed",
+            ),
+            (
+                Ok(response(json!({"ok":false,"error":"ratelimited"}))),
+                SlackError::HttpFailed,
+                "http-failed",
+            ),
+            (
+                Ok(response(json!({"ok":false}))),
+                SlackError::HttpFailed,
+                "http-failed",
+            ),
+            (
+                Ok(response(json!({"ok":false,"error":"canvas_not_found"}))),
+                SlackError::NotFound,
+                "not-found",
+            ),
+            (
+                Ok(response(json!({"ok":false,"error":"canvas_deleted"}))),
+                SlackError::NotFound,
+                "not-found",
+            ),
+            (
+                Ok(response(json!({"ok":false,"error":"access_denied"}))),
+                SlackError::AccessDenied,
+                "access-denied",
+            ),
+            (
+                Ok(response(json!({"ok":false,"error":"missing_scope"}))),
+                SlackError::AccessDenied,
+                "access-denied",
+            ),
+            (
+                Ok(response(
+                    json!({"ok":false,"error":"canvas_disabled_user_team"}),
+                )),
+                SlackError::AccessDenied,
+                "access-denied",
+            ),
+            (
+                Ok(status(200, "not json")),
+                SlackError::InvalidResponse,
+                "invalid-response",
+            ),
+            (
+                Ok(response(json!({"ok":true}))),
+                SlackError::InvalidResponse,
+                "invalid-response",
+            ),
+            (
+                Ok(response(json!({"ok":true,"content":7}))),
+                SlackError::InvalidResponse,
+                "invalid-response",
+            ),
+            (
+                Err(HttpErrorCode::ResponseTooLarge),
+                SlackError::TooLarge,
+                "too-large",
+            ),
+            (
+                Err(HttpErrorCode::Timeout),
+                SlackError::HttpFailed,
+                "http-failed",
+            ),
+        ];
+        for (reply, expected, code) in cases {
+            let mut requests = Vec::new();
+            let error = read(&base, "F0SYNTH", |request| {
+                requests.push(request);
+                reply.clone().map_err(|code| HttpError {
+                    code,
+                    message: "simulated failure".into(),
+                })
+            })
+            .err()
+            .expect("refusal");
+            assert_eq!(discriminant(&error), discriminant(&expected));
+            assert_eq!(crate::Failure::code(&error).as_str(), code);
+            assert_eq!(requests.len(), 1);
+            assert_request(
+                &requests[0],
+                "/api/canvases.getContent",
+                &json!({"canvas_id":"F0SYNTH","content_type":"markdown"}),
+            );
+        }
+    }
+
+    #[test]
+    fn native_read_lookup_replace_read_cycle_edits_only_the_looked_up_section_of_a_synthetic_canvas_not_live_slack()
+     {
+        let base = Base::from_static("https://slack.com");
+        let intro = "# Plan\nKeep this intro exactly.";
+        let status_before = "## Status\nStatus: amber, waiting on review.";
+        let status_after = "## Status\nStatus: green, review done.";
+        let notes = "## Notes\nUnrelated notes stay put.";
+        let mut canvas = [
+            ("temp:C:aaa".to_owned(), intro.to_owned()),
+            ("temp:C:bbb".to_owned(), status_before.to_owned()),
+            ("temp:C:ccc".to_owned(), notes.to_owned()),
+        ];
+        let mut requests: Vec<Request> = Vec::new();
+        let mut send = |request: Request| -> Result<Response, HttpError> {
+            let body: Value = serde_json::from_slice(&request.body).expect("body");
+            let path = request
+                .uri
+                .trim_start_matches("https://slack.com")
+                .to_owned();
+            requests.push(request);
+            Ok(response(match path.as_str() {
+                "/api/canvases.getContent" => {
+                    let content: Vec<&str> = canvas.iter().map(|(_, text)| text.as_str()).collect();
+                    json!({"ok":true,"content":content.join("\n")})
+                }
+                "/api/canvases.sections.lookup" => {
+                    let needle = body["criteria"]["contains_text"]
+                        .as_str()
+                        .expect("criteria");
+                    let ids: Vec<Value> = canvas
+                        .iter()
+                        .filter(|(_, text)| text.contains(needle))
+                        .map(|(id, _)| json!({"id": id}))
+                        .collect();
+                    json!({"ok":true,"sections":ids})
+                }
+                "/api/canvases.edit" => {
+                    let change = &body["changes"][0];
+                    let id = change["section_id"].as_str().expect("section");
+                    let markdown = change["document_content"]["markdown"]
+                        .as_str()
+                        .expect("markdown");
+                    let section = canvas
+                        .iter_mut()
+                        .find(|(sid, _)| sid == id)
+                        .expect("known section");
+                    section.1 = markdown.to_owned();
+                    json!({"ok":true})
+                }
+                other => panic!("unexpected path {other}"),
+            }))
+        };
+        let before = read(&base, "F0SYNTH", &mut send).expect("first read");
+        let looked_up = lookup(&base, "F0SYNTH", "Status: amber", &mut send).expect("lookup");
+        let replaced =
+            replace(&base, "F0SYNTH", "Status: amber", status_after, &mut send).expect("replace");
+        let after = read(&base, "F0SYNTH", &mut send).expect("second read");
+
+        assert_eq!(
+            before.markdown,
+            format!("{intro}\n{status_before}\n{notes}")
+        );
+        assert_eq!(after.markdown, format!("{intro}\n{status_after}\n{notes}"));
+        assert!(!after.markdown.contains("amber"));
+        let sections: Vec<&str> = looked_up.sections.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(sections, ["temp:C:bbb"]);
+        assert_eq!(replaced.section_id, "temp:C:bbb");
+        assert_eq!(requests.len(), 6);
+        let read_body = json!({"canvas_id":"F0SYNTH","content_type":"markdown"});
+        let lookup_body =
+            json!({"canvas_id":"F0SYNTH","criteria":{"contains_text":"Status: amber"}});
+        for (request, (path, body)) in requests.iter().zip([
+            ("/api/canvases.getContent", read_body.clone()),
+            ("/api/canvases.sections.lookup", lookup_body.clone()),
+            ("/api/canvases.sections.lookup", lookup_body),
+            ("/api/canvases.edit", json!({"canvas_id":"F0SYNTH","changes":[{"operation":"replace","section_id":"temp:C:bbb","document_content":{"type":"markdown","markdown":status_after}}]})),
+            ("/api/canvases.sections.lookup", json!({"canvas_id":"F0SYNTH","criteria":{"contains_text":"## Status"}})),
+            ("/api/canvases.getContent", read_body),
+        ]) {
+            assert_request(request, path, &body);
         }
     }
 }

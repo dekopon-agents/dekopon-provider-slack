@@ -1,11 +1,11 @@
-use crate::{Lookup, LookupInput, Post, PostInput, Replace, ReplaceInput, Slack};
+use crate::{Lookup, LookupInput, Post, PostInput, Read, ReadInput, Replace, ReplaceInput, Slack};
 use clap::{Parser, Subcommand};
 use dekopon_provider_sdk::provider::{Proposal, Usage};
 
 #[derive(Parser)]
 #[command(
     name = "slack",
-    about = "Narrow Slack operations; canvas content read is unsupported"
+    about = "Narrow Slack operations on the owner-pinned canvas and channel messages"
 )]
 pub struct Args {
     #[command(subcommand)]
@@ -40,6 +40,9 @@ enum Canvas {
         #[arg(value_name = "MARKDOWN")]
         markdown: String,
     },
+    #[command(
+        about = "Read the whole owner-pinned canvas as Markdown; edit a section with replace"
+    )]
     Read,
 }
 
@@ -71,8 +74,6 @@ pub(crate) fn propose(args: Args) -> Result<Proposal<Slack>, Usage> {
         })),
         Command::Canvas {
             operation: Canvas::Read,
-        } => Err(Usage::new(
-            "canvas content read is unsupported; lookup returns section IDs only",
-        )),
+        } => Ok(Proposal::to::<Read>(ReadInput {})),
     }
 }
