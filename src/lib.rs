@@ -1,4 +1,4 @@
-//! Narrow Slack capabilities. No canvas content read or generic API passthrough.
+//! Narrow Slack capabilities: a whole-canvas Markdown read of the owner-pinned canvas, but no generic API passthrough.
 
 use dekopon_provider_sdk::provider::endpoint::Base;
 use dekopon_provider_sdk::provider::{
@@ -74,7 +74,7 @@ impl Provider for Slack {
     const COMMAND_WORDS: &'static [&'static str] = &["slack"];
     const DESCRIPTION: &'static str = "Narrow Slack canvas and message operations";
     type Args = commands::Args;
-    type Capabilities = (Lookup, Replace, Post);
+    type Capabilities = (Lookup, Replace, Post, Read);
 
     fn propose(args: Self::Args, _stdin_piped: bool) -> Result<Proposal<Self>, Usage> {
         commands::propose(args)
@@ -193,6 +193,38 @@ impl Capability for Post {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadInput {}
+
+pub struct Read;
+impl Capability for Read {
+    type Provider = Slack;
+    const NAME: &'static str = "canvas.read";
+    const DESCRIPTION: &'static str =
+        "Read the whole owner-pinned canvas as Markdown; edits go through canvas.replace";
+    const EFFECT: EffectKind = EffectKind::ReadOnly;
+    const RISK: RiskLevel = RiskLevel::Medium;
+    type Input = ReadInput;
+    type Needs = (Settings<SlackSettings>, Http);
+    type Error = SlackError;
+
+    fn run(
+        _input: Self::Input,
+        (settings, http): Self::Needs,
+        out: &mut Stdout,
+    ) -> Result<(), Self::Error> {
+        let settings = settings.into_inner();
+        let result = slack::read(&settings.base_url, settings.canvas_id()?, |request| {
+            http.send(request)
+        })?;
+        serde_json::to_writer(&mut *out, &result).map_err(|_| SlackError::InvalidResponse)?;
+        out.write_all(b"\n")
+            .map_err(|_| SlackError::InvalidResponse)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub enum SlackError {
     InvalidSettings,
@@ -206,6 +238,7 @@ pub enum SlackError {
     HttpFailed,
     InvalidTimestamp,
     PostRefused,
+    TooLarge,
 }
 impl fmt::Display for SlackError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -221,6 +254,7 @@ impl fmt::Display for SlackError {
             Self::HttpFailed => "Slack request failed",
             Self::InvalidTimestamp => "invalid Slack thread timestamp",
             Self::PostRefused => "Slack refused the post",
+            Self::TooLarge => "canvas exceeds the response size limit",
         })
     }
 }
@@ -238,6 +272,7 @@ impl Failure for SlackError {
             Self::HttpFailed => Code::new("http-failed"),
             Self::InvalidTimestamp => Code::new("invalid-timestamp"),
             Self::PostRefused => Code::new("post-refused"),
+            Self::TooLarge => Code::new("too-large"),
         }
     }
 }
@@ -248,7 +283,7 @@ mod tests {
     use dekopon_provider_sdk::provider::{Code, Failure};
 
     #[test]
-    fn empty_canvas_setting_returns_typed_invalid_settings() {
+    fn native_empty_canvas_setting_returns_typed_invalid_settings() {
         let settings: SlackSettings =
             serde_json::from_str(r#"{"canvasId":""}"#).expect("settings shape");
         let error = settings.canvas_id().expect_err("empty canvas ID");

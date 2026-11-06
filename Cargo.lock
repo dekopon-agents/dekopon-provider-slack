@@ -714,6 +714,7 @@ name = "dekopon-slack-provider"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dekopon-broker-host",
  "dekopon-provider-sdk",
  "dekopon-provider-sdk-testkit",
  "schemars",
