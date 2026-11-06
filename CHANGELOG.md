@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- First release: `slack.canvas.lookup`, `slack.canvas.replace` and `slack.post`, each separately granted, against the owner-pinned canvas from `providerSettings.slack.canvasId`.
+- First release: separately granted `slack.canvas.lookup` and `slack.canvas.replace` against the owner-pinned canvas from `providerSettings.slack.canvasId`, plus separately granted `slack.post` to a caller-supplied channel, optionally in a thread.
 
 ### Changed
 
