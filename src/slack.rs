@@ -266,10 +266,11 @@ fn verification_probe(block: &str) -> Result<String, SlackError> {
                     (best, best_len)
                 }
             });
-    if !longest.chars().any(char::is_alphanumeric) {
+    let probe: String = longest.chars().take(64).collect();
+    if !probe.chars().any(char::is_alphanumeric) {
         return Err(SlackError::InvalidInput);
     }
-    Ok(longest.chars().take(64).collect())
+    Ok(probe)
 }
 
 pub fn replace(
@@ -637,6 +638,33 @@ mod tests {
         ] {
             let mut requests = Vec::new();
             let result = replace(&base, "canvas", "Log", markdown, |request| {
+                requests.push(request);
+                Ok(response(json!({"ok":true,"sections":[{"id":"one"}]})))
+            });
+            assert!(
+                matches!(result, Err(SlackError::InvalidInput)),
+                "{markdown:?}"
+            );
+            assert!(requests.is_empty(), "{markdown:?}");
+        }
+    }
+
+    #[test]
+    fn native_probe_is_checked_after_truncation_so_periods_before_a_late_letter_refuse_with_zero_requests()
+     {
+        let base = Base::from_static("https://slack.com");
+        for markdown in [
+            format!("{}a", ".".repeat(64)),
+            format!("{} a", ".".repeat(63)),
+            format!("## {}1", ".".repeat(64)),
+            format!("{}\u{e9}", "\u{2026}".repeat(64)),
+        ] {
+            assert!(matches!(
+                verification_probe(single_block(&markdown).expect("one block")),
+                Err(SlackError::InvalidInput)
+            ));
+            let mut requests = Vec::new();
+            let result = replace(&base, "canvas", "Log", &markdown, |request| {
                 requests.push(request);
                 Ok(response(json!({"ok":true,"sections":[{"id":"one"}]})))
             });
