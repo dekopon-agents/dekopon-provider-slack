@@ -266,7 +266,7 @@ fn verification_probe(block: &str) -> Result<String, SlackError> {
                     (best, best_len)
                 }
             });
-    if longest.is_empty() {
+    if !longest.chars().any(char::is_alphanumeric) {
         return Err(SlackError::InvalidInput);
     }
     Ok(longest.chars().take(64).collect())
@@ -617,7 +617,8 @@ mod tests {
         );
         for block in [
             "---", "* * *", ":tada:", "**", "## ", "##", "######", "-", "*", "+", "1.", "2)", ">",
-            "- [ ]", "- [x]", "1. [X]",
+            "- [ ]", "- [x]", "1. [X]", "- #", "- ## ", "1. ##", "- [ ] #", "## ##", "# #",
+            "- - #", "> - #", "...",
         ] {
             assert!(
                 matches!(verification_probe(block), Err(SlackError::InvalidInput)),
@@ -630,7 +631,10 @@ mod tests {
     fn native_markup_only_block_whose_trailing_space_is_trimmed_refuses_invalid_input_with_zero_requests()
      {
         let base = Base::from_static("https://slack.com");
-        for markdown in ["## ", "######\t", "- ", "1. ", "- [ ] ", "> "] {
+        for markdown in [
+            "## ", "######\t", "- ", "1. ", "- [ ] ", "> ", "- #", "- ## ", "1. ##", "- [ ] #",
+            "## ##", "# #", "- - #", "> - #", "...",
+        ] {
             let mut requests = Vec::new();
             let result = replace(&base, "canvas", "Log", markdown, |request| {
                 requests.push(request);
