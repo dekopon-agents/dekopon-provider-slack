@@ -109,7 +109,7 @@ fn native_canvas_verbs_propose_typed_inputs_and_read_takes_no_arguments() {
 }
 
 #[test]
-fn post_proposes_typed_top_level_and_thread_inputs() {
+fn native_post_proposes_typed_top_level_and_thread_inputs() {
     for (argv, expected) in [
         (
             vec!["post", "C123", "hello"],

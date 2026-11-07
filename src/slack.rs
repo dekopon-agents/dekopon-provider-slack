@@ -170,16 +170,107 @@ fn verify_response(response: Response, section_id: &str) -> Result<(), SlackErro
     }
 }
 
+fn is_blank(c: char) -> bool {
+    c == ' ' || c == '\t'
+}
+
 fn single_block(markdown: &str) -> Result<&str, SlackError> {
     let mut lines = markdown
         .split(['\n', '\r'])
-        .map(str::trim)
+        .map(|line| line.trim_matches(is_blank))
         .filter(|line| !line.is_empty());
     let block = lines.next().ok_or(SlackError::InvalidInput)?;
     if lines.next().is_some() {
         return Err(SlackError::MultipleBlocks);
     }
     Ok(block)
+}
+
+fn strip_block_marker(mut line: &str) -> &str {
+    while let Some(rest) = line.strip_prefix('>') {
+        line = rest.trim_start_matches(is_blank);
+    }
+    if ['-', '*', '_'].iter().any(|&rule| {
+        line.chars().filter(|&c| c == rule).count() >= 3
+            && line.chars().all(|c| c == rule || is_blank(c))
+    }) {
+        return "";
+    }
+    let hashes = line.len() - line.trim_start_matches('#').len();
+    if (1..=6).contains(&hashes) && line[hashes..].starts_with(is_blank) {
+        return line[hashes..].trim_start_matches(is_blank);
+    }
+    let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let item = if ["- ", "* ", "+ ", "-\t", "*\t", "+\t"]
+        .iter()
+        .any(|bullet| line.starts_with(bullet))
+    {
+        Some(&line[1..])
+    } else if (1..=9).contains(&digits)
+        && line[digits..].starts_with(['.', ')'])
+        && line[digits + 1..].starts_with(is_blank)
+    {
+        Some(&line[digits + 1..])
+    } else {
+        None
+    };
+    let Some(item) = item else {
+        return line;
+    };
+    let item = item.trim_start_matches(is_blank);
+    ["[ ]", "[x]", "[X]"]
+        .iter()
+        .find_map(|box_| {
+            item.strip_prefix(box_)
+                .filter(|rest| rest.starts_with(is_blank))
+        })
+        .unwrap_or(item)
+        .trim_start_matches(is_blank)
+}
+
+fn verification_probe(block: &str) -> Result<String, SlackError> {
+    let mut runs = vec![String::new()];
+    let mut chars = strip_block_marker(block).chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ']' if chars.peek() == Some(&'(') => {
+                chars.by_ref().find(|&c| c == ')');
+                runs.push(String::new());
+            }
+            '<' => {
+                chars.by_ref().find(|&c| c == '>');
+                runs.push(String::new());
+            }
+            ':' => {
+                let name = chars
+                    .clone()
+                    .take_while(|&c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-'))
+                    .count();
+                if name > 0 && chars.clone().nth(name) == Some(':') {
+                    chars.nth(name);
+                }
+                runs.push(String::new());
+            }
+            '*' | '_' | '`' | '~' | '[' | ']' | '>' | '!' | '\\' | '|' | '&' => {
+                runs.push(String::new());
+            }
+            c => runs.last_mut().expect("one run").push(c),
+        }
+    }
+    let longest = runs
+        .iter()
+        .map(|run| run.trim_matches(is_blank))
+        .fold("", |best, run| {
+            if run.chars().count() > best.chars().count() {
+                run
+            } else {
+                best
+            }
+        });
+    if longest.is_empty() {
+        return Err(SlackError::InvalidInput);
+    }
+    Ok(longest.chars().take(64).collect())
 }
 
 pub fn replace(
@@ -192,7 +283,7 @@ pub fn replace(
     if section_match.trim().is_empty() {
         return Err(SlackError::InvalidInput);
     }
-    let verify_text: String = single_block(markdown)?.chars().take(64).collect();
+    let verify_text = verification_probe(single_block(markdown)?)?;
     let id = pre_edit(lookup_sections(base, canvas_id, section_match, &mut send)?)?;
     let body = json!({"canvas_id":canvas_id,"changes":[{"operation":"replace","section_id":id,"document_content":{"type":"markdown","markdown":markdown}}]});
     let response = post(base, "/api/canvases.edit", body, &mut send).map_err(write_error)?;
@@ -483,46 +574,138 @@ mod tests {
     }
 
     #[test]
+    fn native_only_spaces_and_tabs_are_blank_so_a_no_break_space_line_is_its_own_block() {
+        assert!(matches!(
+            single_block("\u{a0}\nmac-verify after 2026-11-07"),
+            Err(SlackError::MultipleBlocks)
+        ));
+        assert_eq!(single_block(" \t\u{a0}\t ").expect("one block"), "\u{a0}");
+        assert_eq!(
+            single_block("\t \nmac-verify after\t\n \t").expect("one block"),
+            "mac-verify after"
+        );
+    }
+
+    #[test]
+    fn native_verification_probe_is_the_longest_plain_text_run_after_the_block_marker() {
+        for (block, probe) in [
+            ("mac-verify after 2026-11-07", "mac-verify after 2026-11-07"),
+            ("## Log", "Log"),
+            ("### Log v2", "Log v2"),
+            ("#hashtag stays", "#hashtag stays"),
+            ("- [x] Ship the fix", "Ship the fix"),
+            ("12. Twelfth item", "Twelfth item"),
+            ("> > Quoted twice", "Quoted twice"),
+            ("Ship **the provider fix** today", "the provider fix"),
+            (
+                "See [the release plan](https://example.invalid/a-much-longer-url-path) now",
+                "the release plan",
+            ),
+            (
+                "Mail <https://example.invalid/very-long-autolink-path> to Ann",
+                "to Ann",
+            ),
+            ("Status: green :white_check_mark:", "Status"),
+        ] {
+            assert_eq!(verification_probe(block).expect("probe"), probe, "{block}");
+        }
+        assert_eq!(
+            verification_probe(&"x".repeat(80))
+                .expect("probe")
+                .chars()
+                .count(),
+            64
+        );
+        for block in ["---", "* * *", ":tada:", "**", "## "] {
+            assert!(
+                matches!(verification_probe(block), Err(SlackError::InvalidInput)),
+                "{block}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_heading_replacement_verifies_with_the_heading_text_not_its_markup() {
+        let base = Base::from_static("https://slack.com");
+        let mut requests = Vec::new();
+        let result = replace(&base, "canvas", "Log", "## Log v2", |request| {
+            requests.push(request);
+            Ok(response(match requests.len() {
+                2 => json!({"ok":true}),
+                _ => json!({"ok":true,"sections":[{"id":"heading"}]}),
+            }))
+        })
+        .expect("replace");
+        assert_eq!(result.section_id, "heading");
+        assert_eq!(requests.len(), 3);
+        for (request, (path, body)) in requests.iter().zip([
+            ("/api/canvases.sections.lookup", json!({"canvas_id":"canvas","criteria":{"contains_text":"Log"}})),
+            ("/api/canvases.edit", json!({"canvas_id":"canvas","changes":[{"operation":"replace","section_id":"heading","document_content":{"type":"markdown","markdown":"## Log v2"}}]})),
+            ("/api/canvases.sections.lookup", json!({"canvas_id":"canvas","criteria":{"contains_text":"Log v2"}})),
+        ]) {
+            assert_request(request, path, &body);
+        }
+    }
+
+    #[test]
     fn native_replace_failures_are_typed_by_stage_and_never_send_a_fourth_request() {
         let base = Base::from_static("https://slack.com");
         let lookup = response(json!({"ok":true,"sections":[{"id":"one"}]}));
-        for (edit, verification, count, expected) in [
+        for (edit, verification, count, variant, code) in [
             (
                 response(json!({"ok":false,"error":"canvas_editing_locked"})),
                 None,
                 2,
+                SlackError::Conflict,
                 "conflict",
             ),
             (
                 response(json!({"ok":false,"error":"fatal_error"})),
                 None,
                 2,
+                SlackError::UnknownResult,
                 "unknown-result",
             ),
-            (status(500, r#"{"ok":true}"#), None, 2, "unknown-result"),
-            (status(200, "not json"), None, 2, "unknown-result"),
+            (
+                status(500, r#"{"ok":true}"#),
+                None,
+                2,
+                SlackError::UnknownResult,
+                "unknown-result",
+            ),
+            (
+                status(200, "not json"),
+                None,
+                2,
+                SlackError::UnknownResult,
+                "unknown-result",
+            ),
             (
                 response(json!({"ok":true})),
                 Some(response(json!({"ok":true,"sections":[{"id":"changed"}]}))),
                 3,
+                SlackError::AcceptedUnverified,
                 "accepted-unverified",
             ),
             (
                 response(json!({"ok":true})),
                 Some(response(json!({"ok":true,"sections":[]}))),
                 3,
+                SlackError::AcceptedUnverified,
                 "accepted-unverified",
             ),
             (
                 response(json!({"ok":true})),
                 Some(response(json!({"ok":false,"sections":[{"id":"one"}]}))),
                 3,
+                SlackError::AcceptedUnverified,
                 "accepted-unverified",
             ),
             (
                 response(json!({"ok":true})),
                 Some(status(500, r#"{"ok":true,"sections":[{"id":"one"}]}"#)),
                 3,
+                SlackError::AcceptedUnverified,
                 "accepted-unverified",
             ),
         ] {
@@ -538,7 +721,11 @@ mod tests {
             })
             .err()
             .expect("refusal");
-            assert_eq!(crate::Failure::code(&error).as_str(), expected);
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&variant)
+            );
+            assert_eq!(crate::Failure::code(&error).as_str(), code);
             assert_eq!(requests.len(), count);
             for (request, (path, body)) in requests.iter().zip([
                 ("/api/canvases.sections.lookup", json!({"canvas_id":"canvas","criteria":{"contains_text":"old"}})),
