@@ -162,12 +162,115 @@ fn edit_response(response: Response) -> Result<(), SlackError> {
 }
 
 fn verify_response(response: Response, section_id: &str) -> Result<(), SlackError> {
-    let sections = lookup_response(response).map_err(|_| SlackError::UnknownResult)?;
-    if sections.len() == 1 && sections[0].id == section_id {
+    let sections = lookup_response(response).map_err(|_| SlackError::AcceptedUnverified)?;
+    if sections.iter().any(|section| section.id == section_id) {
         Ok(())
     } else {
-        Err(SlackError::UnknownResult)
+        Err(SlackError::AcceptedUnverified)
     }
+}
+
+fn is_blank(c: char) -> bool {
+    c == ' ' || c == '\t'
+}
+
+fn single_block(markdown: &str) -> Result<&str, SlackError> {
+    let mut lines = markdown
+        .split(['\n', '\r'])
+        .map(|line| line.trim_matches(is_blank))
+        .filter(|line| !line.is_empty());
+    let block = lines.next().ok_or(SlackError::InvalidInput)?;
+    if lines.next().is_some() {
+        return Err(SlackError::MultipleBlocks);
+    }
+    Ok(block)
+}
+
+fn ends_marker(rest: &str) -> bool {
+    rest.is_empty() || rest.starts_with(is_blank)
+}
+
+fn strip_block_marker(mut line: &str) -> &str {
+    while let Some(rest) = line.strip_prefix('>') {
+        line = rest.trim_start_matches(is_blank);
+    }
+    if ['-', '*', '_'].iter().any(|&rule| {
+        line.chars().filter(|&c| c == rule).count() >= 3
+            && line.chars().all(|c| c == rule || is_blank(c))
+    }) {
+        return "";
+    }
+    let hashes = line.len() - line.trim_start_matches('#').len();
+    if (1..=6).contains(&hashes) && ends_marker(&line[hashes..]) {
+        return line[hashes..].trim_start_matches(is_blank);
+    }
+    let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let item = if line.starts_with(['-', '*', '+']) && ends_marker(&line[1..]) {
+        Some(&line[1..])
+    } else if (1..=9).contains(&digits)
+        && line[digits..].starts_with(['.', ')'])
+        && ends_marker(&line[digits + 1..])
+    {
+        Some(&line[digits + 1..])
+    } else {
+        None
+    };
+    let Some(item) = item else {
+        return line;
+    };
+    let item = item.trim_start_matches(is_blank);
+    ["[ ]", "[x]", "[X]"]
+        .iter()
+        .find_map(|box_| item.strip_prefix(box_).filter(|rest| ends_marker(rest)))
+        .unwrap_or(item)
+        .trim_start_matches(is_blank)
+}
+
+fn verification_probe(block: &str) -> Result<String, SlackError> {
+    let mut runs = vec![String::new()];
+    let mut chars = strip_block_marker(block).chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ']' if chars.peek() == Some(&'(') => {
+                chars.by_ref().find(|&c| c == ')');
+                runs.push(String::new());
+            }
+            '<' => {
+                chars.by_ref().find(|&c| c == '>');
+                runs.push(String::new());
+            }
+            ':' => {
+                let name = chars
+                    .clone()
+                    .take_while(|&c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-'))
+                    .count();
+                if name > 0 && chars.clone().nth(name) == Some(':') {
+                    chars.nth(name);
+                }
+                runs.push(String::new());
+            }
+            '*' | '_' | '`' | '~' | '[' | ']' | '>' | '!' | '\\' | '|' | '&' => {
+                runs.push(String::new());
+            }
+            c => runs.last_mut().expect("one run").push(c),
+        }
+    }
+    let (longest, _) =
+        runs.iter()
+            .map(|run| run.trim_matches(is_blank))
+            .fold(("", 0), |(best, best_len), run| {
+                let len = run.chars().count();
+                if len > best_len {
+                    (run, len)
+                } else {
+                    (best, best_len)
+                }
+            });
+    let probe: String = longest.chars().take(64).collect();
+    if !probe.chars().any(char::is_alphanumeric) {
+        return Err(SlackError::InvalidInput);
+    }
+    Ok(probe)
 }
 
 pub fn replace(
@@ -180,11 +283,7 @@ pub fn replace(
     if section_match.trim().is_empty() {
         return Err(SlackError::InvalidInput);
     }
-    let line = markdown
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .ok_or(SlackError::InvalidInput)?;
-    let verify_text: String = line.trim().chars().take(64).collect();
+    let verify_text = verification_probe(single_block(markdown)?)?;
     let id = pre_edit(lookup_sections(base, canvas_id, section_match, &mut send)?)?;
     let body = json!({"canvas_id":canvas_id,"changes":[{"operation":"replace","section_id":id,"document_content":{"type":"markdown","markdown":markdown}}]});
     let response = post(base, "/api/canvases.edit", body, &mut send).map_err(write_error)?;
@@ -195,7 +294,7 @@ pub fn replace(
         json!({"canvas_id":canvas_id,"criteria":{"contains_text":verify_text}}),
         &mut send,
     )
-    .map_err(|_| SlackError::UnknownResult)?;
+    .map_err(|_| SlackError::AcceptedUnverified)?;
     verify_response(verification, &id)?;
     Ok(ReplaceResult {
         canvas_id: canvas_id.to_owned(),
@@ -366,7 +465,8 @@ mod tests {
     }
 
     #[test]
-    fn native_verification_connect_refusal_after_accepted_edit_is_unknown_without_retry() {
+    fn native_verification_connect_refusal_after_accepted_edit_is_accepted_unverified_without_retry()
+     {
         let base = Base::from_static("https://slack.com");
         let mut requests = Vec::new();
         let result = replace(&base, "canvas", "old", "new", |request| {
@@ -380,7 +480,7 @@ mod tests {
                 }),
             }
         });
-        assert!(matches!(result, Err(SlackError::UnknownResult)));
+        assert!(matches!(result, Err(SlackError::AcceptedUnverified)));
         assert_eq!(requests.len(), 3);
         for (request, (path, body)) in requests.iter().zip([
             ("/api/canvases.sections.lookup", json!({"canvas_id":"canvas","criteria":{"contains_text":"old"}})),
@@ -415,14 +515,14 @@ mod tests {
                 response(json!({"ok":true,"sections":[{"id":"changed"}]})),
                 "original"
             ),
-            Err(SlackError::UnknownResult)
+            Err(SlackError::AcceptedUnverified)
         ));
         assert!(matches!(
             verify_response(
                 response(json!({"ok":false,"sections":[{"id":"original"}]})),
                 "original"
             ),
-            Err(SlackError::UnknownResult)
+            Err(SlackError::AcceptedUnverified)
         ));
         assert!(
             verify_response(
@@ -434,50 +534,250 @@ mod tests {
     }
 
     #[test]
-    fn native_replace_stops_after_sequence_failure_without_retry() {
+    fn native_verification_passes_when_the_edited_id_is_one_of_two_matches() {
+        for sections in [
+            json!([{"id":"other"},{"id":"edited"}]),
+            json!([{"id":"edited"},{"id":"other"}]),
+        ] {
+            assert!(
+                verify_response(response(json!({"ok":true,"sections":sections})), "edited").is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn native_markdown_of_more_than_one_block_refuses_multiple_blocks_and_one_line_is_one_block() {
+        for markdown in [
+            "## Log\n\nLog line one: synthetic.\n\nmac-verify after 2026-11-07",
+            "## Status\nStatus: green",
+            "first paragraph\n\nsecond paragraph",
+            "- one\n- two",
+            "| a | b |\n| --- | --- |\n| 1 | 2 |",
+            "first\rsecond",
+        ] {
+            let error = single_block(markdown).expect_err("more than one block");
+            assert!(matches!(error, SlackError::MultipleBlocks));
+            assert_eq!(crate::Failure::code(&error).as_str(), "multiple-blocks");
+            assert_eq!(crate::Failure::code(&error).status().get(), 2);
+        }
+        for (markdown, block) in [
+            ("mac-verify after 2026-11-07", "mac-verify after 2026-11-07"),
+            ("\n  ## Log  \n\n", "## Log"),
+            ("- one", "- one"),
+        ] {
+            assert_eq!(single_block(markdown).expect("one block"), block);
+        }
+        assert!(matches!(
+            single_block(" \n\t\r"),
+            Err(SlackError::InvalidInput)
+        ));
+    }
+
+    #[test]
+    fn native_only_spaces_and_tabs_are_blank_so_a_no_break_space_line_is_its_own_block() {
+        assert!(matches!(
+            single_block("\u{a0}\nmac-verify after 2026-11-07"),
+            Err(SlackError::MultipleBlocks)
+        ));
+        assert_eq!(single_block(" \t\u{a0}\t ").expect("one block"), "\u{a0}");
+        assert_eq!(
+            single_block("\t \nmac-verify after\t\n \t").expect("one block"),
+            "mac-verify after"
+        );
+    }
+
+    #[test]
+    fn native_verification_probe_is_the_longest_plain_text_run_after_the_block_marker() {
+        for (block, probe) in [
+            ("mac-verify after 2026-11-07", "mac-verify after 2026-11-07"),
+            ("## Log", "Log"),
+            ("### Log v2", "Log v2"),
+            ("#hashtag stays", "#hashtag stays"),
+            ("- [x] Ship the fix", "Ship the fix"),
+            ("12. Twelfth item", "Twelfth item"),
+            ("> > Quoted twice", "Quoted twice"),
+            ("Ship **the provider fix** today", "the provider fix"),
+            (
+                "See [the release plan](https://example.invalid/a-much-longer-url-path) now",
+                "the release plan",
+            ),
+            (
+                "Mail <https://example.invalid/very-long-autolink-path> to Ann",
+                "to Ann",
+            ),
+            ("Status: green :white_check_mark:", "Status"),
+        ] {
+            assert_eq!(verification_probe(block).expect("probe"), probe, "{block}");
+        }
+        assert_eq!(
+            verification_probe(&"x".repeat(80))
+                .expect("probe")
+                .chars()
+                .count(),
+            64
+        );
+        for block in [
+            "---", "* * *", ":tada:", "**", "## ", "##", "######", "-", "*", "+", "1.", "2)", ">",
+            "- [ ]", "- [x]", "1. [X]", "- #", "- ## ", "1. ##", "- [ ] #", "## ##", "# #",
+            "- - #", "> - #", "...",
+        ] {
+            assert!(
+                matches!(verification_probe(block), Err(SlackError::InvalidInput)),
+                "{block}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_markup_only_block_whose_trailing_space_is_trimmed_refuses_invalid_input_with_zero_requests()
+     {
         let base = Base::from_static("https://slack.com");
-        for (edit, verification, count, conflict) in [
+        for markdown in [
+            "## ", "######\t", "- ", "1. ", "- [ ] ", "> ", "- #", "- ## ", "1. ##", "- [ ] #",
+            "## ##", "# #", "- - #", "> - #", "...",
+        ] {
+            let mut requests = Vec::new();
+            let result = replace(&base, "canvas", "Log", markdown, |request| {
+                requests.push(request);
+                Ok(response(json!({"ok":true,"sections":[{"id":"one"}]})))
+            });
+            assert!(
+                matches!(result, Err(SlackError::InvalidInput)),
+                "{markdown:?}"
+            );
+            assert!(requests.is_empty(), "{markdown:?}");
+        }
+    }
+
+    #[test]
+    fn native_probe_is_checked_after_truncation_so_periods_before_a_late_letter_refuse_with_zero_requests()
+     {
+        let base = Base::from_static("https://slack.com");
+        for markdown in [
+            format!("{}a", ".".repeat(64)),
+            format!("{} a", ".".repeat(63)),
+            format!("## {}1", ".".repeat(64)),
+            format!("{}\u{e9}", "\u{2026}".repeat(64)),
+        ] {
+            assert!(matches!(
+                verification_probe(single_block(&markdown).expect("one block")),
+                Err(SlackError::InvalidInput)
+            ));
+            let mut requests = Vec::new();
+            let result = replace(&base, "canvas", "Log", &markdown, |request| {
+                requests.push(request);
+                Ok(response(json!({"ok":true,"sections":[{"id":"one"}]})))
+            });
+            assert!(
+                matches!(result, Err(SlackError::InvalidInput)),
+                "{markdown:?}"
+            );
+            assert!(requests.is_empty(), "{markdown:?}");
+        }
+    }
+
+    #[test]
+    fn native_heading_replacement_verifies_with_the_heading_text_not_its_markup() {
+        let base = Base::from_static("https://slack.com");
+        let mut requests = Vec::new();
+        let result = replace(&base, "canvas", "Log", "## Log v2", |request| {
+            requests.push(request);
+            Ok(response(match requests.len() {
+                2 => json!({"ok":true}),
+                _ => json!({"ok":true,"sections":[{"id":"heading"}]}),
+            }))
+        })
+        .expect("replace");
+        assert_eq!(result.section_id, "heading");
+        assert_eq!(requests.len(), 3);
+        for (request, (path, body)) in requests.iter().zip([
+            ("/api/canvases.sections.lookup", json!({"canvas_id":"canvas","criteria":{"contains_text":"Log"}})),
+            ("/api/canvases.edit", json!({"canvas_id":"canvas","changes":[{"operation":"replace","section_id":"heading","document_content":{"type":"markdown","markdown":"## Log v2"}}]})),
+            ("/api/canvases.sections.lookup", json!({"canvas_id":"canvas","criteria":{"contains_text":"Log v2"}})),
+        ]) {
+            assert_request(request, path, &body);
+        }
+    }
+
+    #[test]
+    fn native_replace_failures_are_typed_by_stage_and_never_send_a_fourth_request() {
+        let base = Base::from_static("https://slack.com");
+        let lookup = response(json!({"ok":true,"sections":[{"id":"one"}]}));
+        for (edit, verification, count, variant, code) in [
             (
-                json!({"ok":false,"error":"canvas_editing_locked"}),
-                json!({"ok":true,"sections":[{"id":"one"}]}),
+                response(json!({"ok":false,"error":"canvas_editing_locked"})),
+                None,
                 2,
-                true,
+                SlackError::Conflict,
+                "conflict",
             ),
             (
-                json!({"ok":false,"error":"fatal_error"}),
-                json!({"ok":true,"sections":[{"id":"one"}]}),
+                response(json!({"ok":false,"error":"fatal_error"})),
+                None,
                 2,
-                false,
+                SlackError::UnknownResult,
+                "unknown-result",
             ),
             (
-                json!({"ok":true}),
-                json!({"ok":true,"sections":[{"id":"changed"}]}),
-                3,
-                false,
+                status(500, r#"{"ok":true}"#),
+                None,
+                2,
+                SlackError::UnknownResult,
+                "unknown-result",
             ),
             (
-                json!({"ok":true}),
-                json!({"ok":false,"sections":[{"id":"one"}]}),
+                status(200, "not json"),
+                None,
+                2,
+                SlackError::UnknownResult,
+                "unknown-result",
+            ),
+            (
+                response(json!({"ok":true})),
+                Some(response(json!({"ok":true,"sections":[{"id":"changed"}]}))),
                 3,
-                false,
+                SlackError::AcceptedUnverified,
+                "accepted-unverified",
+            ),
+            (
+                response(json!({"ok":true})),
+                Some(response(json!({"ok":true,"sections":[]}))),
+                3,
+                SlackError::AcceptedUnverified,
+                "accepted-unverified",
+            ),
+            (
+                response(json!({"ok":true})),
+                Some(response(json!({"ok":false,"sections":[{"id":"one"}]}))),
+                3,
+                SlackError::AcceptedUnverified,
+                "accepted-unverified",
+            ),
+            (
+                response(json!({"ok":true})),
+                Some(status(500, r#"{"ok":true,"sections":[{"id":"one"}]}"#)),
+                3,
+                SlackError::AcceptedUnverified,
+                "accepted-unverified",
             ),
         ] {
-            let replies = [
-                json!({"ok":true,"sections":[{"id":"one"}]}),
-                edit,
-                verification,
-            ];
+            let mut replies = vec![lookup.clone(), edit];
+            replies.extend(verification);
             let mut requests = Vec::new();
-            let result = replace(&base, "canvas", "old", "new", |request| {
-                let reply = response(replies[requests.len()].clone());
+            let error = replace(&base, "canvas", "old", "new", |request| {
                 requests.push(request);
-                Ok(reply)
-            });
-            if conflict {
-                assert!(matches!(result, Err(SlackError::Conflict)));
-            } else {
-                assert!(matches!(result, Err(SlackError::UnknownResult)));
-            }
+                Ok(replies
+                    .get(requests.len() - 1)
+                    .cloned()
+                    .unwrap_or_else(|| lookup.clone()))
+            })
+            .err()
+            .expect("refusal");
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&variant)
+            );
+            assert_eq!(crate::Failure::code(&error).as_str(), code);
             assert_eq!(requests.len(), count);
             for (request, (path, body)) in requests.iter().zip([
                 ("/api/canvases.sections.lookup", json!({"canvas_id":"canvas","criteria":{"contains_text":"old"}})),
@@ -487,6 +787,38 @@ mod tests {
                 assert_request(request, path, &body);
             }
         }
+    }
+
+    #[test]
+    fn native_edit_transport_failure_is_unknown_result_without_verification_or_retry() {
+        let base = Base::from_static("https://slack.com");
+        let mut requests = Vec::new();
+        let error = replace(&base, "canvas", "old", "new", |request| {
+            requests.push(request);
+            if requests.len() == 1 {
+                Ok(response(json!({"ok":true,"sections":[{"id":"one"}]})))
+            } else {
+                Err(HttpError {
+                    code: HttpErrorCode::Timeout,
+                    message: "simulated timeout".into(),
+                })
+            }
+        })
+        .err()
+        .expect("refusal");
+        assert!(matches!(error, SlackError::UnknownResult));
+        assert_eq!(crate::Failure::code(&error).as_str(), "unknown-result");
+        assert_eq!(requests.len(), 2);
+        assert_request(
+            &requests[0],
+            "/api/canvases.sections.lookup",
+            &json!({"canvas_id":"canvas","criteria":{"contains_text":"old"}}),
+        );
+        assert_request(
+            &requests[1],
+            "/api/canvases.edit",
+            &json!({"canvas_id":"canvas","changes":[{"operation":"replace","section_id":"one","document_content":{"type":"markdown","markdown":"new"}}]}),
+        );
     }
 
     fn assert_request(request: &Request, path: &str, body: &Value) {
@@ -608,18 +940,33 @@ mod tests {
     }
 
     #[test]
-    fn native_read_lookup_replace_read_cycle_edits_only_the_looked_up_section_of_a_synthetic_canvas_not_live_slack()
+    fn native_read_lookup_replace_read_cycle_over_a_repeated_heading_edits_only_the_looked_up_block_of_a_synthetic_canvas_not_live_slack()
      {
         let base = Base::from_static("https://slack.com");
-        let intro = "# Plan\nKeep this intro exactly.";
-        let status_before = "## Status\nStatus: amber, waiting on review.";
-        let status_after = "## Status\nStatus: green, review done.";
-        let notes = "## Notes\nUnrelated notes stay put.";
+        let before_block = "mac-verify before";
+        let after_block = "mac-verify after 2026-11-07";
         let mut canvas = [
-            ("temp:C:aaa".to_owned(), intro.to_owned()),
-            ("temp:C:bbb".to_owned(), status_before.to_owned()),
-            ("temp:C:ccc".to_owned(), notes.to_owned()),
+            ("temp:C:aaa".to_owned(), "# Plan".to_owned()),
+            ("temp:C:bbb".to_owned(), "## Log".to_owned()),
+            (
+                "temp:C:ccc".to_owned(),
+                "Log line one: synthetic canvas created.".to_owned(),
+            ),
+            ("temp:C:ddd".to_owned(), before_block.to_owned()),
+            ("temp:C:eee".to_owned(), "## Log".to_owned()),
+            (
+                "temp:C:fff".to_owned(),
+                "Archive: mac-verify after 2026-11-07 was planned.".to_owned(),
+            ),
         ];
+        let rendered = |canvas: &[(String, String)]| {
+            canvas
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        let before_canvas = rendered(&canvas);
         let mut requests: Vec<Request> = Vec::new();
         let mut send = |request: Request| -> Result<Response, HttpError> {
             let body: Value = serde_json::from_slice(&request.body).expect("body");
@@ -629,10 +976,7 @@ mod tests {
                 .to_owned();
             requests.push(request);
             Ok(response(match path.as_str() {
-                "/api/canvases.getContent" => {
-                    let content: Vec<&str> = canvas.iter().map(|(_, text)| text.as_str()).collect();
-                    json!({"ok":true,"content":content.join("\n")})
-                }
+                "/api/canvases.getContent" => json!({"ok":true,"content":rendered(&canvas)}),
                 "/api/canvases.sections.lookup" => {
                     let needle = body["criteria"]["contains_text"]
                         .as_str()
@@ -661,30 +1005,38 @@ mod tests {
             }))
         };
         let before = read(&base, "F0SYNTH", &mut send).expect("first read");
-        let looked_up = lookup(&base, "F0SYNTH", "Status: amber", &mut send).expect("lookup");
+        let looked_up = lookup(&base, "F0SYNTH", before_block, &mut send).expect("lookup");
+        let refused = replace(
+            &base,
+            "F0SYNTH",
+            before_block,
+            &format!("## Log\n\nLog line one: synthetic canvas created.\n\n{after_block}"),
+            &mut send,
+        );
         let replaced =
-            replace(&base, "F0SYNTH", "Status: amber", status_after, &mut send).expect("replace");
+            replace(&base, "F0SYNTH", before_block, after_block, &mut send).expect("replace");
         let after = read(&base, "F0SYNTH", &mut send).expect("second read");
 
+        assert!(matches!(refused, Err(SlackError::MultipleBlocks)));
+        assert_eq!(before.markdown, before_canvas);
         assert_eq!(
-            before.markdown,
-            format!("{intro}\n{status_before}\n{notes}")
+            after.markdown,
+            before_canvas.replacen(before_block, after_block, 1)
         );
-        assert_eq!(after.markdown, format!("{intro}\n{status_after}\n{notes}"));
-        assert!(!after.markdown.contains("amber"));
+        assert_eq!(after.markdown.matches("## Log").count(), 2);
+        assert_eq!(after.markdown.matches(after_block).count(), 2);
         let sections: Vec<&str> = looked_up.sections.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(sections, ["temp:C:bbb"]);
-        assert_eq!(replaced.section_id, "temp:C:bbb");
+        assert_eq!(sections, ["temp:C:ddd"]);
+        assert_eq!(replaced.section_id, "temp:C:ddd");
         assert_eq!(requests.len(), 6);
         let read_body = json!({"canvas_id":"F0SYNTH","content_type":"markdown"});
-        let lookup_body =
-            json!({"canvas_id":"F0SYNTH","criteria":{"contains_text":"Status: amber"}});
+        let lookup_body = json!({"canvas_id":"F0SYNTH","criteria":{"contains_text":before_block}});
         for (request, (path, body)) in requests.iter().zip([
             ("/api/canvases.getContent", read_body.clone()),
             ("/api/canvases.sections.lookup", lookup_body.clone()),
             ("/api/canvases.sections.lookup", lookup_body),
-            ("/api/canvases.edit", json!({"canvas_id":"F0SYNTH","changes":[{"operation":"replace","section_id":"temp:C:bbb","document_content":{"type":"markdown","markdown":status_after}}]})),
-            ("/api/canvases.sections.lookup", json!({"canvas_id":"F0SYNTH","criteria":{"contains_text":"## Status"}})),
+            ("/api/canvases.edit", json!({"canvas_id":"F0SYNTH","changes":[{"operation":"replace","section_id":"temp:C:ddd","document_content":{"type":"markdown","markdown":after_block}}]})),
+            ("/api/canvases.sections.lookup", json!({"canvas_id":"F0SYNTH","criteria":{"contains_text":after_block}})),
             ("/api/canvases.getContent", read_body),
         ]) {
             assert_request(request, path, &body);

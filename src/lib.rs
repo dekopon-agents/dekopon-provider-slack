@@ -234,6 +234,8 @@ pub enum SlackError {
     Ambiguous,
     Conflict,
     UnknownResult,
+    AcceptedUnverified,
+    MultipleBlocks,
     AccessDenied,
     HttpFailed,
     InvalidTimestamp,
@@ -250,6 +252,12 @@ impl fmt::Display for SlackError {
             Self::Ambiguous => "more than one section matched",
             Self::Conflict => "canvas section edit conflicts with current state",
             Self::UnknownResult => "Slack result could not be verified",
+            Self::AcceptedUnverified => {
+                "Slack accepted the edit but it could not be verified; run canvas read before any further edit"
+            }
+            Self::MultipleBlocks => {
+                "Markdown must be one block: one non-empty line, with no heading or other block beside it"
+            }
             Self::AccessDenied => "canvas not accessible to this credential",
             Self::HttpFailed => "Slack request failed",
             Self::InvalidTimestamp => "invalid Slack thread timestamp",
@@ -268,6 +276,8 @@ impl Failure for SlackError {
             Self::Ambiguous => Code::new("ambiguous"),
             Self::Conflict => Code::new("conflict"),
             Self::UnknownResult => Code::new("unknown-result"),
+            Self::AcceptedUnverified => Code::new("accepted-unverified"),
+            Self::MultipleBlocks => Code::new("multiple-blocks").exiting(2),
             Self::AccessDenied => Code::new("access-denied"),
             Self::HttpFailed => Code::new("http-failed"),
             Self::InvalidTimestamp => Code::new("invalid-timestamp"),

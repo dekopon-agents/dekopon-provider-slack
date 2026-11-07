@@ -30,14 +30,27 @@ enum Command {
 
 #[derive(Subcommand)]
 enum Canvas {
+    #[command(
+        about = "List the IDs of every canvas section containing TEXT; the IDs are for information and are not replace input"
+    )]
     Lookup {
         #[arg(value_name = "TEXT")]
         text: String,
     },
+    #[command(
+        about = "Replace the one canvas block that contains SECTION_MATCH with one block of Markdown",
+        after_help = "After any failure, run `slack canvas read` before another edit."
+    )]
     Replace {
-        #[arg(value_name = "SECTION_MATCH")]
+        #[arg(
+            value_name = "SECTION_MATCH",
+            help = "Text that must appear in exactly one block of the canvas; it is search text, not a section ID"
+        )]
         section_match: String,
-        #[arg(value_name = "MARKDOWN")]
+        #[arg(
+            value_name = "MARKDOWN",
+            help = "One line of Markdown that replaces only the matched block; carry only that block's new text, never its surrounding heading or neighbouring blocks"
+        )]
         markdown: String,
     },
     #[command(
