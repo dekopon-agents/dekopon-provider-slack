@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-07
+
+### Fixed
+
+- `slack canvas replace` refuses Markdown of more than one block (`multiple-blocks`) before any Slack request.
+- `slack canvas replace` verification succeeds when the edited section is one of several sections matching the replacement text.
+- An edit Slack accepted but that could not be verified fails `accepted-unverified`, telling the caller to read the canvas before any further edit, instead of `unknown-result`.
+- `slack canvas replace` and `slack canvas lookup` help say SECTION_MATCH is search text, not a section ID, and MARKDOWN carries only the matched block.
+
 ## [0.2.0] - 2026-11-06
 
 ### Added
