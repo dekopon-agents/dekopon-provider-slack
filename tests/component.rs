@@ -535,7 +535,7 @@ fn replace_refuses_before_a_second_request() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
-fn native_replace_sends_one_section_edit_and_one_verification()
+fn native_single_block_replace_sends_three_requests_and_verifies_with_the_replacement_text()
 -> Result<(), Box<dyn std::error::Error>> {
     let native = Native::<Slack>::new()
         .settings(json!({"canvasId":CANVAS}))
@@ -544,7 +544,7 @@ fn native_replace_sends_one_section_edit_and_one_verification()
             "POST",
             reply(json!({"ok":true,"sections":[{"id":"one"}]})),
         ));
-    let markdown = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789--EXTRA\nnext";
+    let markdown = "\n ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789--EXTRA \n";
     let output = native.call(
         "slack.canvas.replace",
         &json!({"sectionMatch":"Status","markdown":markdown}).to_string(),
@@ -588,6 +588,99 @@ fn native_replace_sends_one_section_edit_and_one_verification()
         json!({"canvas_id":CANVAS,"criteria":{"contains_text":"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789--"}})
     );
     Ok(())
+}
+
+#[test]
+fn replace_refuses_multi_block_markdown_before_http_without_echoing_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    for markdown in [
+        "## Log\n\nLog line one: synthetic canvas created.\n\nmac-verify after 2026-11-07",
+        "## Log\nmac-verify after 2026-11-07",
+        "- first\n- second",
+    ] {
+        let output = Harness::<Slack>::get(component())
+            .settings(json!({"canvasId":CANVAS}))
+            .call(
+                "slack.canvas.replace",
+                json!({"sectionMatch":"mac-verify before","markdown":markdown}),
+            )?;
+        assert_eq!(output.status, 2, "{}", output.stderr);
+        assert_eq!(
+            output.stderr,
+            "Markdown must be one block: one non-empty line, with no heading or other block beside it\n"
+        );
+        assert!(!output.stderr.contains("mac-verify"));
+        assert!(output.stdout.is_empty());
+        assert!(output.http_calls.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn section_id_as_section_match_is_searched_as_text_and_refused_not_found_after_one_lookup()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = Harness::<Slack>::get(component()).http(HttpScript::new(
+        "slack.com",
+        "POST",
+        reply(json!({"ok":true,"sections":[]})),
+    ));
+    let origin = harness.origin().expect("script origin").to_owned();
+    let output = harness
+        .settings(json!({"canvasId":CANVAS,"baseUrl":origin}))
+        .call(
+            "slack.canvas.replace",
+            json!({"sectionMatch":"temp:C:synthetic0001","markdown":"New"}),
+        )?;
+    assert_eq!(output.status, 1);
+    assert_eq!(
+        output.stderr,
+        "no matching section or canvas not available\n"
+    );
+    assert_eq!(output.http_calls.len(), 1);
+    let request = output.http_request.as_ref().expect("lookup request");
+    assert_eq!(
+        request.uri,
+        format!("{origin}/api/canvases.sections.lookup")
+    );
+    assert_eq!(request.method, "POST");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&request.body)?,
+        json!({"canvas_id":CANVAS,"criteria":{"contains_text":"temp:C:synthetic0001"}})
+    );
+    assert!(
+        !request
+            .headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case("authorization"))
+    );
+    Ok(())
+}
+
+#[test]
+fn native_canvas_help_says_section_match_is_text_markdown_is_one_block_and_lookup_ids_are_not_replace_input()
+ {
+    let help = |verb: &str| {
+        let CommandRunOutcome::Rendered { stdout, status, .. } =
+            provider::command::<Slack>(&["canvas".into(), verb.into(), "--help".into()], false)
+        else {
+            panic!("help must render")
+        };
+        assert_eq!(status, 0);
+        stdout
+    };
+    let replace = help("replace");
+    for phrase in [
+        "Text that must appear in exactly one block of the canvas; it is search text, not a section ID",
+        "replaces only the matched block; carry only that block's new text, never its surrounding heading or neighbouring blocks",
+        "After any failure, run `slack canvas read` before another edit.",
+    ] {
+        assert!(replace.contains(phrase), "{replace}");
+    }
+    let lookup = help("lookup");
+    assert!(
+        lookup.contains("the IDs are for information and are not replace input"),
+        "{lookup}"
+    );
 }
 
 #[test]
