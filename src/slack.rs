@@ -186,6 +186,10 @@ fn single_block(markdown: &str) -> Result<&str, SlackError> {
     Ok(block)
 }
 
+fn ends_marker(rest: &str) -> bool {
+    rest.is_empty() || rest.starts_with(is_blank)
+}
+
 fn strip_block_marker(mut line: &str) -> &str {
     while let Some(rest) = line.strip_prefix('>') {
         line = rest.trim_start_matches(is_blank);
@@ -197,18 +201,15 @@ fn strip_block_marker(mut line: &str) -> &str {
         return "";
     }
     let hashes = line.len() - line.trim_start_matches('#').len();
-    if (1..=6).contains(&hashes) && line[hashes..].starts_with(is_blank) {
+    if (1..=6).contains(&hashes) && ends_marker(&line[hashes..]) {
         return line[hashes..].trim_start_matches(is_blank);
     }
     let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    let item = if ["- ", "* ", "+ ", "-\t", "*\t", "+\t"]
-        .iter()
-        .any(|bullet| line.starts_with(bullet))
-    {
+    let item = if line.starts_with(['-', '*', '+']) && ends_marker(&line[1..]) {
         Some(&line[1..])
     } else if (1..=9).contains(&digits)
         && line[digits..].starts_with(['.', ')'])
-        && line[digits + 1..].starts_with(is_blank)
+        && ends_marker(&line[digits + 1..])
     {
         Some(&line[digits + 1..])
     } else {
@@ -220,10 +221,7 @@ fn strip_block_marker(mut line: &str) -> &str {
     let item = item.trim_start_matches(is_blank);
     ["[ ]", "[x]", "[X]"]
         .iter()
-        .find_map(|box_| {
-            item.strip_prefix(box_)
-                .filter(|rest| rest.starts_with(is_blank))
-        })
+        .find_map(|box_| item.strip_prefix(box_).filter(|rest| ends_marker(rest)))
         .unwrap_or(item)
         .trim_start_matches(is_blank)
 }
@@ -257,16 +255,17 @@ fn verification_probe(block: &str) -> Result<String, SlackError> {
             c => runs.last_mut().expect("one run").push(c),
         }
     }
-    let longest = runs
-        .iter()
-        .map(|run| run.trim_matches(is_blank))
-        .fold("", |best, run| {
-            if run.chars().count() > best.chars().count() {
-                run
-            } else {
-                best
-            }
-        });
+    let (longest, _) =
+        runs.iter()
+            .map(|run| run.trim_matches(is_blank))
+            .fold(("", 0), |(best, best_len), run| {
+                let len = run.chars().count();
+                if len > best_len {
+                    (run, len)
+                } else {
+                    (best, best_len)
+                }
+            });
     if longest.is_empty() {
         return Err(SlackError::InvalidInput);
     }
@@ -616,11 +615,32 @@ mod tests {
                 .count(),
             64
         );
-        for block in ["---", "* * *", ":tada:", "**", "## "] {
+        for block in [
+            "---", "* * *", ":tada:", "**", "## ", "##", "######", "-", "*", "+", "1.", "2)", ">",
+            "- [ ]", "- [x]", "1. [X]",
+        ] {
             assert!(
                 matches!(verification_probe(block), Err(SlackError::InvalidInput)),
                 "{block}"
             );
+        }
+    }
+
+    #[test]
+    fn native_markup_only_block_whose_trailing_space_is_trimmed_refuses_invalid_input_with_zero_requests()
+     {
+        let base = Base::from_static("https://slack.com");
+        for markdown in ["## ", "######\t", "- ", "1. ", "- [ ] ", "> "] {
+            let mut requests = Vec::new();
+            let result = replace(&base, "canvas", "Log", markdown, |request| {
+                requests.push(request);
+                Ok(response(json!({"ok":true,"sections":[{"id":"one"}]})))
+            });
+            assert!(
+                matches!(result, Err(SlackError::InvalidInput)),
+                "{markdown:?}"
+            );
+            assert!(requests.is_empty(), "{markdown:?}");
         }
     }
 
